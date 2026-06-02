@@ -25,7 +25,7 @@ No schema files. No migrations. No SQL. Just `#[persistent]` and go.
 
 ```toml
 [dependencies]
-airnest = { path = "..." }   # crates.io publish coming soon
+airnest = { version = "0.1.1" }
 serde    = { version = "1", features = ["derive"] }
 ```
 

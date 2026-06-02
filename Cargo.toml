@@ -1,6 +1,6 @@
 [package]
 name = "airnest"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Your Name <you@example.com>"]
 description = "Silent, async SQLite persistence for Rust. Derive once, store forever."

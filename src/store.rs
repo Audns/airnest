@@ -7,7 +7,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use serde::{Serialize, de::DeserializeOwned};
-use sqlx::{Row, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions}};
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use tokio::sync::Mutex;
 
 use crate::{
