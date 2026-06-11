@@ -1,64 +1,200 @@
 //! `Store` — one handle, one file, all types.
 //!
-//! Every `save`/`load`/`delete`/`scan` call is async-friendly via sqlx.
+//! Backed by either SQLite or redb via the [`Backend`] trait.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use serde::{Serialize, de::DeserializeOwned};
-use sqlx::{
-    Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
-use tokio::sync::Mutex;
+use serde::Serialize;
 
 use crate::{
-    codec::Codec, error::StoreError, index::ToIndexValue, into_air_id::IntoAirId,
+    backend::{Backend, BackendBatch, Filter, Order, QueryRequest},
+    codec::Codec,
+    error::StoreError,
+    index::ToIndexValue,
+    into_air_id::IntoAirId,
     persistent::Persistent,
 };
 
-// ── inner connection ──────────────────────────────────────────────────────────
+#[cfg(feature = "redb")]
+use crate::backend::redb::RedbBackend;
+use crate::backend::sqlite::SqliteBackend;
 
-#[derive(Clone)]
-struct Inner {
-    pool: SqlitePool,
-    tables: Arc<Mutex<HashSet<&'static str>>>,
-    codec: Codec,
+// ── BackendKind ───────────────────────────────────────────────────────────────
+
+/// Backend selector for [`StoreBuilder`].
+#[derive(Clone, Copy, Debug)]
+pub enum BackendKind {
+    Sqlite,
+    #[cfg(feature = "redb")]
+    Redb,
 }
 
-impl Inner {
-    async fn open(path: &str) -> Result<Self, StoreError> {
-        let pool = if path == ":memory:" {
-            SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await?
-        } else {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let options = SqliteConnectOptions::new()
-                .filename(path)
-                .create_if_missing(true);
-            SqlitePool::connect_with(options).await?
-        };
+// ── BackendImpl ───────────────────────────────────────────────────────────────
 
-        sqlx::query(
-            "
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=NORMAL;
-            PRAGMA foreign_keys=OFF;
-            ",
-        )
-        .execute(&pool)
-        .await?;
+#[derive(Clone)]
+enum BackendImpl {
+    Sqlite(Arc<SqliteBackend>),
+    #[cfg(feature = "redb")]
+    Redb(Arc<RedbBackend>),
+}
 
-        Ok(Self {
-            pool,
-            tables: Arc::new(Mutex::new(HashSet::new())),
-            codec: Codec::Bitcode,
-        })
+impl BackendImpl {
+    async fn ensure_table<T: Persistent>(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(b) => b.ensure_table::<T>().await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.ensure_table::<T>().await,
+        }
+    }
+
+    async fn save<T: Persistent>(&self, value: &T, codec: Codec) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(b) => b.save(value, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.save(value, codec).await,
+        }
+    }
+
+    async fn load<T: Persistent>(
+        &self,
+        id_bytes: &[u8],
+        codec: Codec,
+    ) -> Result<Option<T>, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.load::<T>(id_bytes, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.load::<T>(id_bytes, codec).await,
+        }
+    }
+
+    async fn load_many<T: Persistent>(
+        &self,
+        ids: &[Vec<u8>],
+        codec: Codec,
+    ) -> Result<Vec<T>, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.load_many::<T>(ids, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.load_many::<T>(ids, codec).await,
+        }
+    }
+
+    async fn exists<T: Persistent>(&self, id_bytes: &[u8]) -> Result<bool, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.exists::<T>(id_bytes).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.exists::<T>(id_bytes).await,
+        }
+    }
+
+    async fn delete<T: Persistent>(&self, id_bytes: &[u8]) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(b) => b.delete::<T>(id_bytes).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.delete::<T>(id_bytes).await,
+        }
+    }
+
+    async fn delete_all<T: Persistent>(&self) -> Result<u64, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.delete_all::<T>().await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.delete_all::<T>().await,
+        }
+    }
+
+    async fn scan<T: Persistent>(&self, codec: Codec) -> Result<Vec<T>, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.scan::<T>(codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.scan::<T>(codec).await,
+        }
+    }
+
+    async fn count<T: Persistent>(&self) -> Result<i64, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.count::<T>().await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.count::<T>().await,
+        }
+    }
+
+    async fn query<T: Persistent>(
+        &self,
+        request: QueryRequest,
+        codec: Codec,
+    ) -> Result<Vec<T>, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.query::<T>(request, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.query::<T>(request, codec).await,
+        }
+    }
+
+    async fn query_count(&self, request: QueryRequest) -> Result<i64, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.query_count(request).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.query_count(request).await,
+        }
+    }
+
+    async fn count_grouped_by<T: Persistent>(
+        &self,
+        column: &str,
+    ) -> Result<HashMap<String, i64>, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.count_grouped_by::<T>(column).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.count_grouped_by::<T>(column).await,
+        }
+    }
+
+    async fn replace_where<T: Persistent>(
+        &self,
+        filters: &[(String, String)],
+        items: &[(Vec<u8>, Vec<u8>, Vec<String>)],
+        codec: Codec,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(b) => b.replace_where::<T>(filters, items, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.replace_where::<T>(filters, items, codec).await,
+        }
+    }
+
+    async fn save_batch(
+        &self,
+        batch: &crate::backend::BackendBatch,
+        codec: Codec,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(b) => b.save_batch(batch, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.save_batch(batch, codec).await,
+        }
+    }
+
+    fn as_sqlite_pool(&self) -> Option<&sqlx::SqlitePool> {
+        match self {
+            Self::Sqlite(b) => b.as_sqlite_pool(),
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.as_sqlite_pool(),
+        }
+    }
+
+    async fn query_raw<T: Persistent>(
+        &self,
+        sql: &str,
+        codec: Codec,
+    ) -> Result<Vec<T>, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.query_raw::<T>(sql, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.query_raw::<T>(sql, codec).await,
+        }
     }
 }
 
@@ -68,6 +204,7 @@ impl Inner {
 pub struct StoreBuilder {
     path: String,
     codec: Option<Codec>,
+    backend: BackendKind,
     pool_size: Option<u32>,
 }
 
@@ -76,6 +213,7 @@ impl StoreBuilder {
         Self {
             path: path.into(),
             codec: None,
+            backend: BackendKind::Sqlite,
             pool_size: None,
         }
     }
@@ -86,7 +224,13 @@ impl StoreBuilder {
         self
     }
 
-    /// Set the connection pool size (currently ignored — reserved for future use).
+    /// Set the backend kind (default: SQLite).
+    pub fn backend(mut self, kind: BackendKind) -> Self {
+        self.backend = kind;
+        self
+    }
+
+    /// Set the connection pool size (SQLite only — reserved for future use).
     pub fn pool_size(mut self, n: u32) -> Self {
         self.pool_size = Some(n);
         self
@@ -94,20 +238,27 @@ impl StoreBuilder {
 
     /// Open the store with the configured options.
     pub async fn open(self) -> Result<Store, StoreError> {
-        let mut inner = Inner::open(&self.path).await?;
-        if let Some(codec) = self.codec {
-            inner.codec = codec;
-        }
-        Ok(Store { inner })
+        let inner = match self.backend {
+            BackendKind::Sqlite => {
+                BackendImpl::Sqlite(Arc::new(SqliteBackend::open(&self.path).await?))
+            }
+            #[cfg(feature = "redb")]
+            BackendKind::Redb => BackendImpl::Redb(Arc::new(RedbBackend::open(&self.path).await?)),
+        };
+        Ok(Store {
+            inner,
+            codec: self.codec.unwrap_or_default(),
+        })
     }
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
-/// An async SQLite-backed store. Cheap to clone — `Arc`-wrapped internally.
+/// An async store backed by SQLite or redb. Cheap to clone — `Arc`-wrapped internally.
 #[derive(Clone)]
 pub struct Store {
-    inner: Inner,
+    inner: BackendImpl,
+    codec: Codec,
 }
 
 impl Store {
@@ -118,9 +269,18 @@ impl Store {
         StoreBuilder::new(path).open().await
     }
 
-    /// Open a transient in-memory database. All data is lost when dropped.
+    /// Open a transient in-memory SQLite database. All data is lost when dropped.
     pub async fn in_memory() -> Result<Self, StoreError> {
         StoreBuilder::new(":memory:").open().await
+    }
+
+    /// Open or create a redb database at `path`.
+    #[cfg(feature = "redb")]
+    pub async fn open_redb(path: &str) -> Result<Self, StoreError> {
+        StoreBuilder::new(path)
+            .backend(BackendKind::Redb)
+            .open()
+            .await
     }
 
     /// Create a [`StoreBuilder`] for advanced configuration.
@@ -131,107 +291,23 @@ impl Store {
     // ── schema ────────────────────────────────────────────────────────────────
 
     pub(crate) async fn ensure_table<T: Persistent>(&self) -> Result<(), StoreError> {
-        let table = T::TABLE;
-        {
-            let guard = self.inner.tables.lock().await;
-            if guard.contains(table) {
-                return Ok(());
-            }
-        }
-
-        let index_cols = T::index_columns().to_vec();
-        let extra_cols: String = index_cols
-            .iter()
-            .map(|c| format!(",\n                     \"{c}\" TEXT"))
-            .collect();
-
-        let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS \"{table}\" (\n                         id       BLOB    NOT NULL PRIMARY KEY,\n                         v        BLOB    NOT NULL,\n                         saved_at INTEGER NOT NULL DEFAULT (unixepoch()){extra_cols}\n                     ) STRICT"
-        );
-
-        sqlx::query(sqlx::AssertSqlSafe(&*create_sql))
-            .execute(&self.inner.pool)
-            .await?;
-
-        for col in &index_cols {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-                "ALTER TABLE \"{table}\" ADD COLUMN \"{col}\" TEXT"
-            )))
-            .execute(&self.inner.pool)
-            .await;
-        }
-
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "CREATE INDEX IF NOT EXISTS \"{table}_saved_at\"\n                     ON \"{table}\" (saved_at)"
-        )))
-        .execute(&self.inner.pool)
-        .await?;
-
-        for col in &index_cols {
-            sqlx::query(sqlx::AssertSqlSafe(&*format!(
-                "CREATE INDEX IF NOT EXISTS \"{table}_{col}_idx\"\n                         ON \"{table}\" (\"{col}\")"
-            )))
-            .execute(&self.inner.pool)
-            .await?;
-        }
-
-        let mut guard = self.inner.tables.lock().await;
-        guard.insert(table);
-        Ok(())
+        self.inner.ensure_table::<T>().await
     }
 
     // ── core CRUD ─────────────────────────────────────────────────────────────
 
     fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, StoreError> {
-        self.inner.codec.encode(value)
-    }
-
-    fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, StoreError> {
-        self.inner.codec.decode(bytes)
+        self.codec.encode(value)
     }
 
     /// Persist a value. **Upsert** semantics: inserts or overwrites by the
-    /// struct's embedded [`AirId`].
+    /// struct's embedded [`AirId`](crate::AirId).
     pub async fn save<T: Persistent>(&self, value: &T) -> Result<(), StoreError> {
         self.ensure_table::<T>().await?;
-
-        let id_bytes = value.id().to_bytes();
-        let v = self.encode(value)?;
-        let table = T::TABLE;
-        let index_cols = T::index_columns().to_vec();
-        let index_vals = value.index_values();
-
-        if index_cols.is_empty() {
-            sqlx::query(sqlx::AssertSqlSafe(&*format!(
-                "INSERT INTO \"{table}\" (id, v, saved_at)\n                             VALUES (?1, ?2, unixepoch())\n                             ON CONFLICT(id) DO UPDATE SET\n                                 v        = excluded.v,\n                                 saved_at = excluded.saved_at"
-            )))
-            .bind(&id_bytes)
-            .bind(&v)
-            .execute(&self.inner.pool)
-            .await?;
-        } else {
-            let col_list: String = index_cols.iter().map(|c| format!(", \"{c}\"")).collect();
-            let placeholders: String = (3..=2 + index_cols.len())
-                .map(|i| format!(", ?{i}"))
-                .collect();
-            let updates: String = index_cols
-                .iter()
-                .map(|c| format!(", \"{c}\" = excluded.\"{c}\""))
-                .collect();
-            let sql = format!(
-                "INSERT INTO \"{table}\" (id, v, saved_at{col_list})\n                         VALUES (?1, ?2, unixepoch(){placeholders})\n                         ON CONFLICT(id) DO UPDATE SET\n                             v        = excluded.v,\n                             saved_at = excluded.saved_at{updates}"
-            );
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-            query = query.bind(&id_bytes).bind(&v);
-            for val in index_vals {
-                query = query.bind(val);
-            }
-            query.execute(&self.inner.pool).await?;
-        }
-        Ok(())
+        self.inner.save(value, self.codec).await
     }
 
-    /// Load a value by id. Accepts an [`AirId`] or a reference to the value itself.
+    /// Load a value by id. Accepts an [`AirId`](crate::AirId) or a reference to the value itself.
     pub async fn load<T, I>(&self, input: I) -> Result<Option<T>, StoreError>
     where
         T: Persistent,
@@ -239,22 +315,7 @@ impl Store {
     {
         self.ensure_table::<T>().await?;
         let id_bytes = input.into_air_id().to_bytes();
-        let table = T::TABLE;
-
-        let row = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "SELECT v FROM \"{table}\" WHERE id = ?1"
-        )))
-        .bind(&id_bytes)
-        .fetch_optional(&self.inner.pool)
-        .await?;
-
-        match row {
-            Some(r) => {
-                let bytes: Vec<u8> = r.get(0);
-                Ok(Some(self.decode(&bytes)?))
-            }
-            None => Ok(None),
-        }
+        self.inner.load::<T>(&id_bytes, self.codec).await
     }
 
     /// Load many values by id in a single query.
@@ -264,28 +325,14 @@ impl Store {
         I: Clone + IntoAirId<T>,
     {
         self.ensure_table::<T>().await?;
-        let table = T::TABLE;
         if ids.is_empty() {
             return Ok(vec![]);
         }
-
-        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
-        let sql = format!(
-            r#"SELECT v FROM "{table}" WHERE id IN ({})"#,
-            placeholders.join(", ")
-        );
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-        for id in ids {
-            query = query.bind(id.clone().into_air_id().to_bytes());
-        }
-
-        let rows = query.fetch_all(&self.inner.pool).await?;
-        rows.into_iter()
-            .map(|r| {
-                let bytes: Vec<u8> = r.get(0);
-                self.decode(&bytes)
-            })
-            .collect::<Result<Vec<T>, _>>()
+        let id_bytes: Vec<Vec<u8>> = ids
+            .iter()
+            .map(|id| id.clone().into_air_id().to_bytes())
+            .collect();
+        self.inner.load_many::<T>(&id_bytes, self.codec).await
     }
 
     /// Check whether an id exists in the store.
@@ -296,17 +343,7 @@ impl Store {
     {
         self.ensure_table::<T>().await?;
         let id_bytes = input.into_air_id().to_bytes();
-        let table = T::TABLE;
-
-        let row = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "SELECT COUNT(*) FROM \"{table}\" WHERE id = ?1"
-        )))
-        .bind(&id_bytes)
-        .fetch_one(&self.inner.pool)
-        .await?;
-
-        let n: i64 = row.get(0);
-        Ok(n > 0)
+        self.inner.exists::<T>(&id_bytes).await
     }
 
     /// Delete a value by id. No-op if the id doesn't exist.
@@ -317,47 +354,20 @@ impl Store {
     {
         self.ensure_table::<T>().await?;
         let id_bytes = input.into_air_id().to_bytes();
-        let table = T::TABLE;
-
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DELETE FROM \"{table}\" WHERE id = ?1"
-        )))
-        .bind(&id_bytes)
-        .execute(&self.inner.pool)
-        .await?;
-
-        Ok(())
+        self.inner.delete::<T>(&id_bytes).await
     }
 
     /// Delete **all** rows of type `T`. Returns the number of rows deleted.
     pub async fn delete_all<T: Persistent>(&self) -> Result<u64, StoreError> {
         self.ensure_table::<T>().await?;
-        let table = T::TABLE;
-
-        let result = sqlx::query(sqlx::AssertSqlSafe(&*format!("DELETE FROM \"{table}\"")))
-            .execute(&self.inner.pool)
-            .await?;
-
-        Ok(result.rows_affected())
+        self.inner.delete_all::<T>().await
     }
 
-    /// Scan all values of type `T`, ordered by save time.
+    /// Scan all values of type `T`, ordered by save time (SQLite) or
+    /// arbitrary order (redb).
     pub async fn scan<T: Persistent>(&self) -> Result<Vec<T>, StoreError> {
         self.ensure_table::<T>().await?;
-        let table = T::TABLE;
-
-        let rows = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "SELECT v FROM \"{table}\" ORDER BY saved_at ASC"
-        )))
-        .fetch_all(&self.inner.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|r| {
-                let bytes: Vec<u8> = r.get(0);
-                self.decode(&bytes)
-            })
-            .collect::<Result<Vec<T>, _>>()
+        self.inner.scan::<T>(self.codec).await
     }
 
     /// Alias for [`Store::scan`] — load every record of type `T` into memory.
@@ -368,16 +378,7 @@ impl Store {
     /// Count all stored values of type `T`.
     pub async fn count<T: Persistent>(&self) -> Result<i64, StoreError> {
         self.ensure_table::<T>().await?;
-        let table = T::TABLE;
-
-        let row = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "SELECT COUNT(*) FROM \"{table}\""
-        )))
-        .fetch_one(&self.inner.pool)
-        .await?;
-
-        let n: i64 = row.get(0);
-        Ok(n)
+        self.inner.count::<T>().await
     }
 
     // ── convenience helpers ───────────────────────────────────────────────────
@@ -401,44 +402,7 @@ impl Store {
 
     /// Atomically save multiple values (possibly of different types) in one transaction.
     pub async fn save_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
-        let setup_sqls = batch.table_setup_sqls;
-        let tables = batch.tables;
-        let entries = batch.entries;
-
-        for sql in &setup_sqls {
-            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-                .execute(&self.inner.pool)
-                .await?;
-        }
-
-        {
-            let mut guard = self.inner.tables.lock().await;
-            for table in &tables {
-                guard.insert(table);
-            }
-        }
-
-        let mut tx = self.inner.pool.begin().await?;
-
-        for (sql, id_bytes, v, index_vals) in &entries {
-            if index_vals.is_empty() {
-                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-                    .bind(id_bytes)
-                    .bind(v)
-                    .execute(&mut *tx)
-                    .await?;
-            } else {
-                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                query = query.bind(id_bytes).bind(v);
-                for val in index_vals {
-                    query = query.bind(val);
-                }
-                query.execute(&mut *tx).await?;
-            }
-        }
-
-        tx.commit().await?;
-        Ok(())
+        self.inner.save_batch(&batch.inner, self.codec).await
     }
 
     /// Start a typed query for `T`.
@@ -447,22 +411,15 @@ impl Store {
     }
 
     /// Execute a raw SQL query and decode the `v` blob column as `T`.
+    ///
+    /// Only available when using the SQLite backend.
     pub async fn query_raw<T: Persistent>(&self, sql: &str) -> Result<Vec<T>, StoreError> {
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .fetch_all(&self.inner.pool)
-            .await?;
-
-        rows.into_iter()
-            .map(|r| {
-                let bytes: Vec<u8> = r.get(0);
-                self.decode(&bytes)
-            })
-            .collect()
+        self.inner.query_raw::<T>(sql, self.codec).await
     }
 
-    /// Access the underlying sqlx pool for custom queries.
-    pub fn pool(&self) -> &SqlitePool {
-        &self.inner.pool
+    /// Access the underlying sqlx pool for custom queries (SQLite only).
+    pub fn pool(&self) -> Option<&sqlx::SqlitePool> {
+        self.inner.as_sqlite_pool()
     }
 
     // ── bulk / set helpers ────────────────────────────────────────────────────
@@ -473,19 +430,7 @@ impl Store {
         column: &str,
     ) -> Result<HashMap<String, i64>, StoreError> {
         self.ensure_table::<T>().await?;
-        let table = T::TABLE;
-        let sql = format!(r#"SELECT "{column}", COUNT(*) FROM "{table}" GROUP BY "{column}""#);
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .fetch_all(&self.inner.pool)
-            .await?;
-        let mut map = HashMap::new();
-        for row in rows {
-            if let Ok(Some(key)) = row.try_get::<Option<String>, _>(0) {
-                let count: i64 = row.get(1);
-                map.insert(key, count);
-            }
-        }
-        Ok(map)
+        self.inner.count_grouped_by::<T>(column).await
     }
 
     /// Delete rows matching filters, then insert the given items.
@@ -499,36 +444,16 @@ impl Store {
         items: &[T],
     ) -> Result<(), StoreError> {
         self.ensure_table::<T>().await?;
-        let table = T::TABLE;
-
-        if !filters.is_empty() {
-            let conditions: Vec<String> = filters
-                .iter()
-                .enumerate()
-                .map(|(i, (col, _))| format!(r#""{col}" = ?{}"#, i + 1))
-                .collect();
-            let sql = format!(
-                r#"DELETE FROM "{table}" WHERE {}"#,
-                conditions.join(" AND ")
-            );
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-            for (_, val) in filters {
-                query = query.bind(val);
-            }
-            query.execute(&self.inner.pool).await?;
-        } else {
-            sqlx::query(sqlx::AssertSqlSafe(
-                format!(r#"DELETE FROM "{table}""#).as_str(),
-            ))
-            .execute(&self.inner.pool)
-            .await?;
-        }
-
-        let mut batch = StoreBatch::with_codec(self.inner.codec);
+        let mut prepared = Vec::with_capacity(items.len());
         for item in items {
-            batch.push(item)?;
+            let id = item.id().to_bytes();
+            let v = self.encode(item)?;
+            let index_vals = item.index_values();
+            prepared.push((id, v, index_vals));
         }
-        self.save_batch(batch).await
+        self.inner
+            .replace_where::<T>(filters, &prepared, self.codec)
+            .await
     }
 
     // ── init registration ─────────────────────────────────────────────────────
@@ -540,23 +465,11 @@ impl Store {
 
     /// Create a [`StoreBatch`] pre-configured with this store's codec.
     pub fn batch(&self) -> StoreBatch {
-        StoreBatch::with_codec(self.inner.codec)
+        StoreBatch::with_codec(self.codec)
     }
 }
 
 // ── Query builder ─────────────────────────────────────────────────────────────
-
-/// Filter condition for [`Query`].
-enum Filter {
-    Eq(String, String),
-    In(String, Vec<String>),
-}
-
-/// Sort direction for [`Query::order_by`].
-pub enum Order {
-    Asc,
-    Desc,
-}
 
 /// Typed query builder for indexed columns.
 ///
@@ -606,59 +519,18 @@ impl<'a, T: Persistent> Query<'a, T> {
         self
     }
 
-    fn build_sql(&self, table: &str, select: &str) -> (String, Vec<String>) {
-        let mut sql = format!(r#"{select} FROM "{table}""#);
-        let mut params: Vec<String> = Vec::new();
-        let mut param_idx = 1;
-
-        if !self.filters.is_empty() {
-            let conditions: Vec<String> = self
-                .filters
-                .iter()
-                .map(|f| match f {
-                    Filter::Eq(col, _) => {
-                        let p = param_idx;
-                        param_idx += 1;
-                        format!(r#""{col}" = ?{p}"#)
-                    }
-                    Filter::In(col, vals) => {
-                        let start = param_idx;
-                        param_idx += vals.len();
-                        let placeholders: Vec<String> =
-                            (start..param_idx).map(|j| format!("?{j}")).collect();
-                        format!(r#""{col}" IN ({})"#, placeholders.join(", "))
-                    }
-                })
-                .collect();
-            sql.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
-            for f in &self.filters {
-                match f {
-                    Filter::Eq(_, v) => params.push(v.clone()),
-                    Filter::In(_, vals) => params.extend(vals.clone()),
-                }
-            }
+    fn to_request(&self) -> QueryRequest {
+        QueryRequest {
+            table: T::TABLE,
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            limit: self.limit,
         }
-
-        for (col, order) in &self.order_by {
-            let dir = match order {
-                Order::Asc => "ASC",
-                Order::Desc => "DESC",
-            };
-            sql.push_str(&format!(r#" ORDER BY "{col}" {dir}"#));
-        }
-
-        if let Some(n) = self.limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
-
-        (sql, params)
     }
 
     /// Execute the query and return all matching rows.
     pub async fn all(self) -> Result<Vec<T>, StoreError> {
         self.store.ensure_table::<T>().await?;
-
-        // Early exit: any empty IN filter means no results.
         for f in &self.filters {
             if let Filter::In(_, vals) = f
                 && vals.is_empty()
@@ -666,22 +538,8 @@ impl<'a, T: Persistent> Query<'a, T> {
                 return Ok(vec![]);
             }
         }
-
-        let table = T::TABLE;
-        let (sql, params) = self.build_sql(table, r#"SELECT v"#);
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-        for p in params {
-            query = query.bind(p);
-        }
-
-        let rows = query.fetch_all(&self.store.inner.pool).await?;
-
-        rows.into_iter()
-            .map(|r| {
-                let bytes: Vec<u8> = r.get(0);
-                self.store.decode(&bytes)
-            })
-            .collect::<Result<Vec<T>, _>>()
+        let request = self.to_request();
+        self.store.inner.query::<T>(request, self.store.codec).await
     }
 
     /// Execute the query and return at most one row.
@@ -693,7 +551,6 @@ impl<'a, T: Persistent> Query<'a, T> {
     /// Count matching rows without decoding blobs.
     pub async fn count(self) -> Result<i64, StoreError> {
         self.store.ensure_table::<T>().await?;
-
         for f in &self.filters {
             if let Filter::In(_, vals) = f
                 && vals.is_empty()
@@ -701,17 +558,8 @@ impl<'a, T: Persistent> Query<'a, T> {
                 return Ok(0);
             }
         }
-
-        let table = T::TABLE;
-        let (sql, params) = self.build_sql(table, "SELECT COUNT(*)");
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-        for p in params {
-            query = query.bind(p);
-        }
-
-        let row = query.fetch_one(&self.store.inner.pool).await?;
-        let n: i64 = row.get(0);
-        Ok(n)
+        let request = self.to_request();
+        self.store.inner.query_count(request).await
     }
 }
 
@@ -820,15 +668,10 @@ impl<'a, T: Persistent + Clone, F: FnOnce(&mut T)> UpsertModifyBuilder<'a, T, F>
 
 // ── StoreBatch ────────────────────────────────────────────────────────────────
 
-/// Single entry in a [`StoreBatch`]: (upsert_sql, id_bytes, v_bytes, index_vals).
-pub type BatchEntry = (String, Vec<u8>, Vec<u8>, Vec<String>);
-
 /// Accumulate heterogeneous saves for one atomic write.
 #[derive(Default)]
 pub struct StoreBatch {
-    pub(crate) table_setup_sqls: Vec<String>,
-    pub(crate) tables: Vec<&'static str>,
-    pub(crate) entries: Vec<BatchEntry>,
+    pub(crate) inner: BackendBatch,
     codec: Option<Codec>,
 }
 
@@ -845,48 +688,20 @@ impl StoreBatch {
         }
     }
 
-    /// Stage a value for saving. Uses the embedded [`AirId`] inside `value`.
+    /// Stage a value for saving. Uses the embedded [`AirId`](crate::AirId) inside `value`.
     pub fn push<T: Persistent>(&mut self, value: &T) -> Result<(), StoreError> {
         let id_bytes = value.id().to_bytes();
-        let index_cols = T::index_columns();
-        let index_vals = value.index_values();
-
         let v = match &self.codec {
             Some(codec) => codec.encode(value)?,
             None => bitcode::serialize(value).map_err(StoreError::Encode)?,
         };
-
-        let extra_cols: String = index_cols
-            .iter()
-            .map(|c| format!(",\n                 \"{c}\" TEXT"))
-            .collect();
-        self.table_setup_sqls.push(format!(
-            "CREATE TABLE IF NOT EXISTS \"{table}\" (\n                 id       BLOB    NOT NULL PRIMARY KEY,\n                 v        BLOB    NOT NULL,\n                 saved_at INTEGER NOT NULL DEFAULT (unixepoch()){extra_cols}\n             ) STRICT",
-            table = T::TABLE,
-        ));
-        self.tables.push(T::TABLE);
-
-        let upsert_sql = if index_cols.is_empty() {
-            format!(
-                "INSERT INTO \"{table}\" (id, v, saved_at)\n                 VALUES (?1, ?2, unixepoch())\n                 ON CONFLICT(id) DO UPDATE SET\n                     v        = excluded.v,\n                     saved_at = excluded.saved_at",
-                table = T::TABLE,
-            )
-        } else {
-            let col_list: String = index_cols.iter().map(|c| format!(", \"{c}\"")).collect();
-            let placeholders: String = (3..=2 + index_cols.len())
-                .map(|i| format!(", ?{i}"))
-                .collect();
-            let updates: String = index_cols
-                .iter()
-                .map(|c| format!(", \"{c}\" = excluded.\"{c}\""))
-                .collect();
-            format!(
-                "INSERT INTO \"{table}\" (id, v, saved_at{col_list})\n                 VALUES (?1, ?2, unixepoch(){placeholders})\n                 ON CONFLICT(id) DO UPDATE SET\n                     v        = excluded.v,\n                     saved_at = excluded.saved_at{updates}",
-                table = T::TABLE,
-            )
-        };
-
-        self.entries.push((upsert_sql, id_bytes, v, index_vals));
+        self.inner.entries.push(crate::backend::BatchEntry {
+            table: T::TABLE,
+            id_bytes,
+            value_bytes: v,
+            index_columns: T::index_columns(),
+            index_values: value.index_values(),
+        });
         Ok(())
     }
 }

@@ -256,7 +256,7 @@ async fn indexed_column_updated_on_save_upsert() {
     let id_bytes = j.id().to_bytes();
     let status: String = sqlx::query_scalar(r#"SELECT "status" FROM "Job" WHERE id = ?1"#)
         .bind(&id_bytes)
-        .fetch_one(s.pool())
+        .fetch_one(s.pool().unwrap())
         .await
         .unwrap();
     assert_eq!(status, "done");

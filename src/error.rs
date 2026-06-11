@@ -20,6 +20,10 @@ pub enum StoreError {
     #[error("mutex poisoned")]
     Poisoned,
 
+    #[cfg(feature = "redb")]
+    #[error("redb: {0}")]
+    Redb(String),
+
     #[error("bad id: {0}")]
     BadId(String),
 }
