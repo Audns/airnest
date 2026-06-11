@@ -32,3 +32,4 @@ redb     = ["dep:redb"]
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
 tempfile = "3"
+anyhow = "1"

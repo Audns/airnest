@@ -479,27 +479,24 @@ impl Backend for RedbBackend {
 
     async fn save_batch(&self, batch: &BackendBatch, _codec: Codec) -> Result<(), StoreError> {
         let db = self.db.clone();
-        let entries: Vec<_> = batch
-            .entries
-            .iter()
-            .map(|e| {
-                let index_map: HashMap<String, String> = e
-                    .index_columns
-                    .iter()
-                    .zip(e.index_values.iter())
-                    .map(|(k, v)| (k.to_string(), v.clone()))
-                    .collect();
-                let rec = Record {
-                    id: e.id_bytes.clone(),
-                    bytes: e.value_bytes.clone(),
-                    saved_at: 0,
-                    index_values: index_map,
-                };
-                let rec_bytes = bitcode::serialize(&rec).unwrap();
-                let key = Self::make_key(e.table, &e.id_bytes);
-                (key, rec_bytes)
-            })
-            .collect();
+        let mut entries = Vec::with_capacity(batch.entries.len());
+        for e in &batch.entries {
+            let index_map: HashMap<String, String> = e
+                .index_columns
+                .iter()
+                .zip(e.index_values.iter())
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            let rec = Record {
+                id: e.id_bytes.clone(),
+                bytes: e.value_bytes.clone(),
+                saved_at: 0,
+                index_values: index_map,
+            };
+            let rec_bytes = bitcode::serialize(&rec).map_err(StoreError::Encode)?;
+            let key = Self::make_key(e.table, &e.id_bytes);
+            entries.push((key, rec_bytes));
+        }
 
         tokio::task::spawn_blocking(move || {
             let txn = db
