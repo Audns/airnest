@@ -1,4 +1,4 @@
-//! airnest 🪹 — Silent, async SQLite (and redb) persistence for Rust.
+//! airnest 🪹 — Silent, async `SQLite` (and redb) persistence for Rust.
 //!
 //! Derive `#[persistent]` once, store forever. See the crate README for
 //! architecture patterns for large codebases (persistence boundaries,

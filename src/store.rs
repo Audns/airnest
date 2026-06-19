@@ -1,6 +1,6 @@
 //! `Store` — one handle, one file, all types.
 //!
-//! Backed by either SQLite or redb via the [`Backend`] trait.
+//! Backed by either `SQLite` or redb via the [`Backend`] trait.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -219,18 +219,21 @@ impl StoreBuilder {
     }
 
     /// Set a custom serialization codec.
+    #[must_use]
     pub fn codec(mut self, codec: Codec) -> Self {
         self.codec = Some(codec);
         self
     }
 
-    /// Set the backend kind (default: SQLite).
+    /// Set the backend kind (default: `SQLite`).
+    #[must_use]
     pub fn backend(mut self, kind: BackendKind) -> Self {
         self.backend = kind;
         self
     }
 
-    /// Set the connection pool size (SQLite only — reserved for future use).
+    /// Set the connection pool size (`SQLite` only — reserved for future use).
+    #[must_use]
     pub fn pool_size(mut self, n: u32) -> Self {
         self.pool_size = Some(n);
         self
@@ -254,7 +257,7 @@ impl StoreBuilder {
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
-/// An async store backed by SQLite or redb. Cheap to clone — `Arc`-wrapped internally.
+/// An async store backed by `SQLite` or redb. Cheap to clone — `Arc`-wrapped internally.
 #[derive(Clone)]
 pub struct Store {
     inner: BackendImpl,
@@ -264,12 +267,12 @@ pub struct Store {
 impl Store {
     // ── constructors ─────────────────────────────────────────────────────────
 
-    /// Open or create a persistent SQLite database at `path`.
+    /// Open or create a persistent `SQLite` database at `path`.
     pub async fn open(path: &str) -> Result<Self, StoreError> {
         StoreBuilder::new(path).open().await
     }
 
-    /// Open a transient in-memory SQLite database. All data is lost when dropped.
+    /// Open a transient in-memory `SQLite` database. All data is lost when dropped.
     pub async fn in_memory() -> Result<Self, StoreError> {
         StoreBuilder::new(":memory:").open().await
     }
@@ -363,7 +366,7 @@ impl Store {
         self.inner.delete_all::<T>().await
     }
 
-    /// Scan all values of type `T`, ordered by save time (SQLite) or
+    /// Scan all values of type `T`, ordered by save time (`SQLite`) or
     /// arbitrary order (redb).
     pub async fn scan<T: Persistent>(&self) -> Result<Vec<T>, StoreError> {
         self.ensure_table::<T>().await?;
@@ -406,18 +409,20 @@ impl Store {
     }
 
     /// Start a typed query for `T`.
+    #[must_use]
     pub fn find<T: Persistent>(&self) -> Query<'_, T> {
         Query::new(self)
     }
 
     /// Execute a raw SQL query and decode the `v` blob column as `T`.
     ///
-    /// Only available when using the SQLite backend.
+    /// Only available when using the `SQLite` backend.
     pub async fn query_raw<T: Persistent>(&self, sql: &str) -> Result<Vec<T>, StoreError> {
         self.inner.query_raw::<T>(sql, self.codec).await
     }
 
-    /// Access the underlying sqlx pool for custom queries (SQLite only).
+    /// Access the underlying sqlx pool for custom queries (`SQLite` only).
+    #[must_use]
     pub fn pool(&self) -> Option<&sqlx::SqlitePool> {
         self.inner.as_sqlite_pool()
     }
@@ -464,6 +469,7 @@ impl Store {
     }
 
     /// Create a [`StoreBatch`] pre-configured with this store's codec.
+    #[must_use]
     pub fn batch(&self) -> StoreBatch {
         StoreBatch::with_codec(self.codec)
     }
@@ -494,6 +500,7 @@ impl<'a, T: Persistent> Query<'a, T> {
     }
 
     /// Filter where `column` equals `value`.
+    #[must_use]
     pub fn eq(mut self, column: &str, value: impl ToIndexValue) -> Self {
         self.filters
             .push(Filter::Eq(column.to_string(), value.to_index_value()));
@@ -501,19 +508,25 @@ impl<'a, T: Persistent> Query<'a, T> {
     }
 
     /// Filter where `column` is in `values`.
+    #[must_use]
     pub fn in_(mut self, column: &str, values: &[impl ToIndexValue]) -> Self {
-        let vals: Vec<String> = values.iter().map(|v| v.to_index_value()).collect();
+        let vals: Vec<String> = values
+            .iter()
+            .map(super::index::ToIndexValue::to_index_value)
+            .collect();
         self.filters.push(Filter::In(column.to_string(), vals));
         self
     }
 
     /// Add an ORDER BY clause.
+    #[must_use]
     pub fn order_by(mut self, column: &str, order: Order) -> Self {
         self.order_by.push((column.to_string(), order));
         self
     }
 
     /// Limit the number of results.
+    #[must_use]
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
@@ -573,6 +586,7 @@ pub struct ReplaceBuilder<'a, T: Persistent> {
 }
 
 impl<'a, T: Persistent> ReplaceBuilder<'a, T> {
+    #[must_use]
     pub fn new(store: &'a Store) -> Self {
         Self {
             store,
@@ -582,6 +596,7 @@ impl<'a, T: Persistent> ReplaceBuilder<'a, T> {
     }
 
     /// Add an equality filter.
+    #[must_use]
     pub fn eq(mut self, column: &str, value: impl ToIndexValue) -> Self {
         self.filters
             .push((column.to_string(), value.to_index_value()));
@@ -605,6 +620,7 @@ pub struct UpsertBuilder<'a, T: Persistent> {
 }
 
 impl<'a, T: Persistent> UpsertBuilder<'a, T> {
+    #[must_use]
     pub fn new(store: &'a Store) -> Self {
         Self {
             store,
@@ -615,6 +631,7 @@ impl<'a, T: Persistent> UpsertBuilder<'a, T> {
     }
 
     /// Add an equality filter.
+    #[must_use]
     pub fn eq(mut self, column: &str, value: impl ToIndexValue) -> Self {
         self.column = Some(column.to_string());
         self.value = Some(value.to_index_value());
@@ -642,26 +659,23 @@ pub struct UpsertModifyBuilder<'a, T: Persistent, F> {
     _phantom: PhantomData<T>,
 }
 
-impl<'a, T: Persistent + Clone, F: FnOnce(&mut T)> UpsertModifyBuilder<'a, T, F> {
+impl<T: Persistent + Clone, F: FnOnce(&mut T)> UpsertModifyBuilder<'_, T, F> {
     /// Finish the upsert: modify existing row or insert a new one.
     pub async fn or_insert<G: FnOnce() -> T>(self, g: G) -> Result<T, StoreError> {
-        match self
+        if let Some(mut item) = self
             .store
             .find::<T>()
             .eq(&self.column, &self.value)
             .first()
             .await?
         {
-            Some(mut item) => {
-                (self.modify)(&mut item);
-                self.store.save(&item).await?;
-                Ok(item)
-            }
-            None => {
-                let item = g();
-                self.store.save(&item).await?;
-                Ok(item)
-            }
+            (self.modify)(&mut item);
+            self.store.save(&item).await?;
+            Ok(item)
+        } else {
+            let item = g();
+            self.store.save(&item).await?;
+            Ok(item)
         }
     }
 }
@@ -676,11 +690,13 @@ pub struct StoreBatch {
 }
 
 impl StoreBatch {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create a batch that uses a specific codec for encoding values.
+    #[must_use]
     pub fn with_codec(codec: Codec) -> Self {
         Self {
             codec: Some(codec),

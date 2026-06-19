@@ -37,10 +37,10 @@ use crate::AirId;
 /// See the `airnest` crate README for a full guide on persistence boundaries,
 /// aggregate-root modelling, repository layers, and domain-module conventions.
 pub trait Persistent: Serialize + DeserializeOwned + Send + Sync + 'static {
-    /// The auto-generated UUIDv7 id embedded in every persisted value.
+    /// The auto-generated `UUIDv7` id embedded in every persisted value.
     fn id(&self) -> AirId<Self>;
 
-    /// SQLite table name — defaults to the struct name.
+    /// `SQLite` table name — defaults to the struct name.
     const TABLE: &'static str;
 
     /// Names of extra columns stored alongside the blob for indexed queries.

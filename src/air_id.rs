@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 
-/// A type-tagged UUIDv7 id. The tag `T` is zero-sized; the id carries no runtime
+/// A type-tagged `UUIDv7` id. The tag `T` is zero-sized; the id carries no runtime
 /// overhead beyond a [`uuid::Uuid`].
 ///
 /// Created by [`Store::save`](crate::Store::save) and used with
@@ -23,7 +23,8 @@ impl<T> Clone for AirId<T> {
 impl<T> Copy for AirId<T> {}
 
 impl<T> AirId<T> {
-    /// Generate a fresh UUIDv7.
+    /// Generate a fresh `UUIDv7`.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             uuid: uuid::Uuid::now_v7(),
@@ -32,11 +33,13 @@ impl<T> AirId<T> {
     }
 
     /// String form for display/logging (`uuid::Uuid::to_string`).
+    #[must_use]
     pub fn to_string_id(&self) -> String {
         self.uuid.to_string()
     }
 
-    /// 16-byte binary form stored in SQLite.
+    /// 16-byte binary form stored in `SQLite`.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         self.uuid.as_bytes().to_vec()
     }

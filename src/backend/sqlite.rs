@@ -1,6 +1,7 @@
-//! SQLite backend implementation.
+//! `SQLite` backend implementation.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::sync::Arc;
 
 // serde used via Codec
@@ -68,10 +69,11 @@ impl SqliteBackend {
             }
         }
 
-        let extra_cols: String = index_cols
+        let extra_cols = index_cols
             .iter()
-            .map(|c| format!(",\n                 \"{c}\" TEXT"))
-            .collect();
+            .map(|c| format!("\"{c}\" TEXT"))
+            .collect::<Vec<_>>()
+            .join(",\n");
 
         let create_sql = format!(
             "CREATE TABLE IF NOT EXISTS \"{table}\" (\n                 id       BLOB    NOT NULL PRIMARY KEY,\n                 v        BLOB    NOT NULL,\n                 saved_at INTEGER NOT NULL DEFAULT (unixepoch()){extra_cols}\n             ) STRICT"
@@ -114,14 +116,19 @@ impl SqliteBackend {
                 "INSERT INTO \"{table}\" (id, v, saved_at)\n                 VALUES (?1, ?2, unixepoch())\n                 ON CONFLICT(id) DO UPDATE SET\n                     v        = excluded.v,\n                     saved_at = excluded.saved_at"
             )
         } else {
-            let col_list: String = index_cols.iter().map(|c| format!(", \"{c}\"")).collect();
-            let placeholders: String = (3..=2 + index_cols.len())
-                .map(|i| format!(", ?{i}"))
-                .collect();
-            let updates: String = index_cols
+            let col_list = index_cols
                 .iter()
-                .map(|c| format!(", \"{c}\" = excluded.\"{c}\""))
-                .collect();
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders = (3..=2 + index_cols.len()).fold(String::new(), |mut acc, i| {
+                write!(acc, ", ?{i}").unwrap();
+                acc
+            });
+            let updates = index_cols.iter().fold(String::new(), |mut acc, c| {
+                write!(acc, ", \"{c}\" = excluded.\"{c}\"").unwrap();
+                acc
+            });
             format!(
                 "INSERT INTO \"{table}\" (id, v, saved_at{col_list})\n                 VALUES (?1, ?2, unixepoch(){placeholders})\n                 ON CONFLICT(id) DO UPDATE SET\n                     v        = excluded.v,\n                     saved_at = excluded.saved_at{updates}"
             )
@@ -152,7 +159,7 @@ impl SqliteBackend {
                     }
                 })
                 .collect();
-            sql.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
+            let _ = write!(sql, " WHERE {}", conditions.join(" AND "));
             for f in &request.filters {
                 match f {
                     Filter::Eq(_, v) => params.push(v.clone()),
@@ -166,11 +173,11 @@ impl SqliteBackend {
                 crate::backend::Order::Asc => "ASC",
                 crate::backend::Order::Desc => "DESC",
             };
-            sql.push_str(&format!(r#" ORDER BY "{col}" {dir}"#));
+            let _ = write!(sql, r#" ORDER BY "{col}" {dir}"#);
         }
 
         if let Some(n) = request.limit {
-            sql.push_str(&format!(" LIMIT {n}"));
+            let _ = write!(sql, " LIMIT {n}");
         }
 
         (sql, params)
@@ -200,14 +207,20 @@ impl Backend for SqliteBackend {
                 .execute(&self.pool)
                 .await?;
         } else {
-            let col_list: String = index_cols.iter().map(|c| format!(", \"{c}\"")).collect();
-            let placeholders: String = (3..=2 + index_cols.len())
-                .map(|i| format!(", ?{i}"))
-                .collect();
-            let updates: String = index_cols
-                .iter()
-                .map(|c| format!(", \"{c}\" = excluded.\"{c}\""))
-                .collect();
+            let col_list = index_cols.iter().fold(String::new(), |mut acc, c| {
+                write!(acc, ", \"{c}\"").unwrap();
+                acc
+            });
+
+            let placeholders = (3..=2 + index_cols.len()).fold(String::new(), |mut acc, i| {
+                write!(acc, ", ?{i}").unwrap();
+                acc
+            });
+
+            let updates = index_cols.iter().fold(String::new(), |mut acc, c| {
+                write!(acc, ", \"{c}\" = excluded.\"{c}\"").unwrap();
+                acc
+            });
             let sql = format!(
                 "INSERT INTO \"{table}\" (id, v, saved_at{col_list})\n                 VALUES (?1, ?2, unixepoch(){placeholders})\n                 ON CONFLICT(id) DO UPDATE SET\n                     v        = excluded.v,\n                     saved_at = excluded.saved_at{updates}"
             );
@@ -337,7 +350,7 @@ impl Backend for SqliteBackend {
         request: QueryRequest,
         codec: Codec,
     ) -> Result<Vec<T>, StoreError> {
-        let (sql, params) = Self::build_sql(&request, r#"SELECT v"#);
+        let (sql, params) = Self::build_sql(&request, r"SELECT v");
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for p in params {
             query = query.bind(p);
@@ -391,7 +404,13 @@ impl Backend for SqliteBackend {
     ) -> Result<(), StoreError> {
         let table = T::TABLE;
 
-        if !filters.is_empty() {
+        if filters.is_empty() {
+            sqlx::query(sqlx::AssertSqlSafe(
+                format!(r#"DELETE FROM "{table}""#).as_str(),
+            ))
+            .execute(&self.pool)
+            .await?;
+        } else {
             let conditions: Vec<String> = filters
                 .iter()
                 .enumerate()
@@ -406,12 +425,6 @@ impl Backend for SqliteBackend {
                 query = query.bind(val);
             }
             query.execute(&self.pool).await?;
-        } else {
-            sqlx::query(sqlx::AssertSqlSafe(
-                format!(r#"DELETE FROM "{table}""#).as_str(),
-            ))
-            .execute(&self.pool)
-            .await?;
         }
 
         let mut batch = BackendBatch::default();
