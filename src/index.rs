@@ -6,12 +6,12 @@
 
 /// Convert a field value into a `SQLite` index column value (stored as TEXT).
 ///
-/// Implemented automatically for any `T: Display`.
+/// Implemented automatically for any `T: Display + ?Sized`.
 pub trait ToIndexValue {
     fn to_index_value(&self) -> String;
 }
 
-impl<T: std::fmt::Display> ToIndexValue for T {
+impl<T: std::fmt::Display + ?Sized> ToIndexValue for T {
     fn to_index_value(&self) -> String {
         self.to_string()
     }

@@ -21,6 +21,9 @@ use crate::{
 use crate::backend::redb::RedbBackend;
 use crate::backend::sqlite::SqliteBackend;
 
+#[cfg(feature = "postgres")]
+use crate::backend::postgres::PostgresBackend;
+
 // ── BackendKind ───────────────────────────────────────────────────────────────
 
 /// Backend selector for [`StoreBuilder`].
@@ -29,6 +32,8 @@ pub enum BackendKind {
     Sqlite,
     #[cfg(feature = "redb")]
     Redb,
+    #[cfg(feature = "postgres")]
+    Postgres,
 }
 
 // ── BackendImpl ───────────────────────────────────────────────────────────────
@@ -38,6 +43,8 @@ enum BackendImpl {
     Sqlite(Arc<SqliteBackend>),
     #[cfg(feature = "redb")]
     Redb(Arc<RedbBackend>),
+    #[cfg(feature = "postgres")]
+    Postgres(Arc<PostgresBackend>),
 }
 
 impl BackendImpl {
@@ -46,6 +53,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.ensure_table::<T>().await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.ensure_table::<T>().await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.ensure_table::<T>().await,
         }
     }
 
@@ -54,6 +63,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.save(value, codec).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.save(value, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.save(value, codec).await,
         }
     }
 
@@ -66,6 +77,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.load::<T>(id_bytes, codec).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.load::<T>(id_bytes, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.load::<T>(id_bytes, codec).await,
         }
     }
 
@@ -78,6 +91,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.load_many::<T>(ids, codec).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.load_many::<T>(ids, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.load_many::<T>(ids, codec).await,
         }
     }
 
@@ -86,6 +101,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.exists::<T>(id_bytes).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.exists::<T>(id_bytes).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.exists::<T>(id_bytes).await,
         }
     }
 
@@ -94,6 +111,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.delete::<T>(id_bytes).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.delete::<T>(id_bytes).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.delete::<T>(id_bytes).await,
         }
     }
 
@@ -102,6 +121,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.delete_all::<T>().await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.delete_all::<T>().await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.delete_all::<T>().await,
         }
     }
 
@@ -110,6 +131,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.scan::<T>(codec).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.scan::<T>(codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.scan::<T>(codec).await,
         }
     }
 
@@ -118,6 +141,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.count::<T>().await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.count::<T>().await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.count::<T>().await,
         }
     }
 
@@ -130,6 +155,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.query::<T>(request, codec).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.query::<T>(request, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.query::<T>(request, codec).await,
         }
     }
 
@@ -138,6 +165,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.query_count(request).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.query_count(request).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.query_count(request).await,
         }
     }
 
@@ -149,6 +178,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.count_grouped_by::<T>(column).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.count_grouped_by::<T>(column).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.count_grouped_by::<T>(column).await,
         }
     }
 
@@ -162,6 +193,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.replace_where::<T>(filters, items, codec).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.replace_where::<T>(filters, items, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.replace_where::<T>(filters, items, codec).await,
         }
     }
 
@@ -174,6 +207,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.save_batch(batch, codec).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.save_batch(batch, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.save_batch(batch, codec).await,
         }
     }
 
@@ -182,6 +217,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.as_sqlite_pool(),
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.as_sqlite_pool(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => None,
         }
     }
 
@@ -194,6 +231,8 @@ impl BackendImpl {
             Self::Sqlite(b) => b.query_raw::<T>(sql, codec).await,
             #[cfg(feature = "redb")]
             Self::Redb(b) => b.query_raw::<T>(sql, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.query_raw::<T>(sql, codec).await,
         }
     }
 }
@@ -247,6 +286,10 @@ impl StoreBuilder {
             }
             #[cfg(feature = "redb")]
             BackendKind::Redb => BackendImpl::Redb(Arc::new(RedbBackend::open(&self.path).await?)),
+            #[cfg(feature = "postgres")]
+            BackendKind::Postgres => {
+                BackendImpl::Postgres(Arc::new(PostgresBackend::open(&self.path).await?))
+            }
         };
         Ok(Store {
             inner,
@@ -282,6 +325,18 @@ impl Store {
     pub async fn open_redb(path: &str) -> Result<Self, StoreError> {
         StoreBuilder::new(path)
             .backend(BackendKind::Redb)
+            .open()
+            .await
+    }
+
+    /// Connect to a PostgreSQL database.
+    ///
+    /// `url` is a standard `postgres://` or `postgresql://` connection URL,
+    /// e.g. `"postgres://user:pass@host:5432/dbname"`.
+    #[cfg(feature = "postgres")]
+    pub async fn open_postgres(url: &str) -> Result<Self, StoreError> {
+        StoreBuilder::new(url)
+            .backend(BackendKind::Postgres)
             .open()
             .await
     }
@@ -501,7 +556,7 @@ impl<'a, T: Persistent> Query<'a, T> {
 
     /// Filter where `column` equals `value`.
     #[must_use]
-    pub fn eq(mut self, column: &str, value: impl ToIndexValue) -> Self {
+    pub fn eq<V: ToIndexValue + ?Sized>(mut self, column: &str, value: &V) -> Self {
         self.filters
             .push(Filter::Eq(column.to_string(), value.to_index_value()));
         self
@@ -597,7 +652,7 @@ impl<'a, T: Persistent> ReplaceBuilder<'a, T> {
 
     /// Add an equality filter.
     #[must_use]
-    pub fn eq(mut self, column: &str, value: impl ToIndexValue) -> Self {
+    pub fn eq<V: ToIndexValue + ?Sized>(mut self, column: &str, value: &V) -> Self {
         self.filters
             .push((column.to_string(), value.to_index_value()));
         self
@@ -632,7 +687,7 @@ impl<'a, T: Persistent> UpsertBuilder<'a, T> {
 
     /// Add an equality filter.
     #[must_use]
-    pub fn eq(mut self, column: &str, value: impl ToIndexValue) -> Self {
+    pub fn eq<V: ToIndexValue + ?Sized>(mut self, column: &str, value: &V) -> Self {
         self.column = Some(column.to_string());
         self.value = Some(value.to_index_value());
         self

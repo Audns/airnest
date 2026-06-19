@@ -1,23 +1,20 @@
-//! `SQLite` backend implementation.
+//! PostgreSQL backend implementation.
 //!
-//! All DDL/DML string generation is delegated to the internal `SqlDialect`
-//! trait. This backend owns the connection pool, table-cache, and bind logic;
-//! the dialect owns the SQL surface.
+//! Activated by the `postgres` feature flag. The dialect is shared with
+//! `SqliteBackend` via [`crate::backend::dialect::SqlDialect`]; this file
+//! owns only the connection pool, bind execution, and PG-specific glue.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use sqlx::{
-    Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tokio::sync::Mutex;
 
 use crate::{
     backend::{
         Backend, BackendBatch, Filter, QueryRequest,
         dialect::{SqlDialect, TableSchema},
-        sqlite_dialect::SqliteDialect,
+        postgres_dialect::PostgresDialect,
     },
     codec::Codec,
     error::StoreError,
@@ -25,33 +22,25 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub struct SqliteBackend {
-    pool: SqlitePool,
+pub struct PostgresBackend {
+    pool: PgPool,
     tables: Arc<Mutex<HashSet<&'static str>>>,
     dialect: Arc<dyn SqlDialect>,
 }
 
-impl SqliteBackend {
-    pub async fn open(path: &str) -> Result<Self, StoreError> {
-        let pool = if path == ":memory:" {
-            SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await?
-        } else {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let options = SqliteConnectOptions::new()
-                .filename(path)
-                .create_if_missing(true);
-            SqlitePool::connect_with(options).await?
-        };
+impl PostgresBackend {
+    /// Open or connect to a PostgreSQL database.
+    ///
+    /// `url` is a standard `postgres://` or `postgresql://` connection URL,
+    /// e.g. `"postgres://user:pass@host:5432/dbname"`.
+    pub async fn open(url: &str) -> Result<Self, StoreError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(10)
+            .connect(url)
+            .await?;
 
-        let dialect: Arc<dyn SqlDialect> = Arc::new(SqliteDialect);
+        let dialect: Arc<dyn SqlDialect> = Arc::new(PostgresDialect);
         for stmt in dialect.session_init_sql() {
-            // PRAGMAs are constants from the dialect; AssertSqlSafe documents
-            // the audit.
             sqlx::query(sqlx::AssertSqlSafe(*stmt))
                 .execute(&pool)
                 .await?;
@@ -85,15 +74,10 @@ impl SqliteBackend {
             .execute(&self.pool)
             .await?;
 
-        // SQLite cannot add columns inside a CREATE TABLE for already-existing
-        // tables, so an idempotent ALTER is issued after the CREATE. CREATE
-        // TABLE IF NOT EXISTS is a no-op when the table already exists with
-        // the expected schema; the ALTER catches the case where it exists but
-        // is missing the column.
+        // ALTER TABLE ADD COLUMN is not idempotent in PG either; ignore the
+        // "duplicate column" error path the same way SqliteBackend does.
         for col in index_cols {
             let add_sql = self.dialect.render_add_column(table, col);
-            // ALTER TABLE ADD COLUMN is not idempotent in SQLite, but ignoring
-            // the "duplicate column" error preserves the existing semantics.
             let _ = sqlx::query(sqlx::AssertSqlSafe(&*add_sql))
                 .execute(&self.pool)
                 .await;
@@ -128,7 +112,6 @@ impl SqliteBackend {
         )
     }
 
-    /// Renders a simple CRUD statement using dialect primitives.
     fn quote(&self, name: &str) -> String {
         self.dialect.quote_ident(name)
     }
@@ -138,7 +121,7 @@ impl SqliteBackend {
     }
 }
 
-impl Backend for SqliteBackend {
+impl Backend for PostgresBackend {
     async fn ensure_table<T: Persistent>(&self) -> Result<(), StoreError> {
         self.ensure_table_raw(T::TABLE, T::index_columns()).await
     }
@@ -363,7 +346,7 @@ impl Backend for SqliteBackend {
                 .await?;
         } else {
             let (where_clause, binds) = self.dialect.render_where_clause(&dialect_filters);
-            let sql = format!("DELETE FROM {} WHERE {where_clause}", self.quote(table));
+            let sql = format!("DELETE FROM {} WHERE {where_clause}", self.quote(table),);
             let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for b in binds {
                 query = query.bind(b);
@@ -414,7 +397,7 @@ impl Backend for SqliteBackend {
     }
 
     fn as_sqlite_pool(&self) -> Option<&sqlx::SqlitePool> {
-        Some(&self.pool)
+        None
     }
 
     async fn query_raw<T: Persistent>(

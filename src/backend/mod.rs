@@ -8,6 +8,20 @@ use crate::{Codec, Persistent, StoreError};
 pub mod redb;
 pub mod sqlite;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
+// Internal SQL dialect abstraction. Crate-internal so it does not appear in
+// the public API; consumed by relational backends to render SQL.
+pub(crate) mod dialect;
+
+pub(crate) mod sqlite_dialect;
+
+// Compile-only stub. Validates that the SqlDialect trait is sufficient for
+// a non-SQLite engine. Used by `postgres` feature; also useful as a
+// reference for future dialect implementors.
+pub(crate) mod postgres_dialect;
+
 /// Filter condition for backend-agnostic queries.
 #[derive(Debug, Clone)]
 pub enum Filter {
