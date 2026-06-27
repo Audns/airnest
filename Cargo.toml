@@ -1,36 +1,28 @@
-[package]
-name = "airnest"
-version = "0.1.4"
-edition = "2024"
-authors = ["Your Name <you@example.com>"]
-description = "Silent, async SQLite persistence for Rust. Derive once, store forever."
-readme = "README.md"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/audns/airnest"
-homepage = "https://github.com/audns/airnest"
-documentation = "https://docs.rs/airnest"
-keywords = ["sqlite", "persistence", "database", "async", "orm"]
-categories = ["database", "asynchronous"]
+[workspace]
+members = [
+"./airnest",
+"./airnest-macros"
+]
+resolver = "2"
 
-[dependencies]
-airnest-macros = { path = "../airnest-macros", version = "0.1" }
-sqlx = { version = "0.9.0", features = ["sqlite", "postgres", "runtime-tokio"] }
-bitcode = { version = "0.6", features = ["serde"] }
-tokio = { version = "1.52", features = ["full"] }
+[workspace.dependencies]
+# Core dependencies
+sqlx = { version = "0.9", features = ["sqlite", "postgres", "runtime-tokio"] }
+tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-uuid = { version = "1.23", features = ["v7", "serde"] }
-postcard = { version = "1.1", optional = true, features = ["use-std"] }
-redb = { version = "4.1.0", optional = true }
-
-[features]
-default = []
-postcard = ["dep:postcard"]
-redb = ["dep:redb"]
-postgres = []
-
-[dev-dependencies]
-tokio = { version = "1.52", features = ["full"] }
+uuid = { version = "1.0", features = ["v7", "serde"] }
+bitcode = { version = "0.6", features = ["serde"] }
+postcard = { version = "1.1", features = ["use-std"] }
+redb = { version = "4.1" }
 tempfile = "3"
 anyhow = "1"
+
+# Proc macro dependencies
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+
+# Internal workspace crate
+airnest-macros = { path = "airnest-macros", version = "0.1" }

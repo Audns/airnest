@@ -1,0 +1,36 @@
+[package]
+name = "airnest"
+version = "0.1.5"
+edition = "2024"
+authors = ["Your Name <you@example.com>"]
+description = "Silent, async SQLite persistence for Rust. Derive once, store forever."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/audns/airnest"
+homepage = "https://github.com/audns/airnest"
+documentation = "https://docs.rs/airnest"
+keywords = ["sqlite", "persistence", "database", "async", "orm"]
+categories = ["database", "asynchronous"]
+
+[dependencies]
+airnest-macros = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite", "postgres", "runtime-tokio"] }
+bitcode = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7", "serde"] }
+postcard = { workspace = true, features = ["use-std"], optional = true }
+redb = { workspace = true , optional = true}
+
+[features]
+default = []
+postcard = ["dep:postcard"]
+redb = ["dep:redb"]
+postgres = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
+anyhow = { workspace = true }

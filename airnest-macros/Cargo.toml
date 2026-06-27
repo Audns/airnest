@@ -1,0 +1,19 @@
+[package]
+name = "airnest-macros"
+version = "0.1.5"
+edition = "2024"
+authors = ["Audns"]
+description = "Procedural macros for the airnest persistence crate."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/audns/airnest"
+documentation = "https://docs.rs/airnest-macros"
+keywords = ["macro", "derive", "persistence", "sqlite"]
+categories = ["database"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = {workspace = true}
+quote = {workspace = true}
+syn = { workspace = true, features = ["full"] }
