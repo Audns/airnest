@@ -38,10 +38,25 @@ impl<T> AirId<T> {
         self.uuid.to_string()
     }
 
-    /// 16-byte binary form stored in `SQLite`.
+    /// 16-byte binary form stored in `SQLite` — stack-allocated, no heap.
     #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.uuid.as_bytes().to_vec()
+    pub fn to_bytes(&self) -> [u8; 16] {
+        *self.uuid.as_bytes()
+    }
+
+    /// Heap-allocated form for APIs that require `Vec<u8>`.
+    #[must_use]
+    pub fn to_bytes_vec(&self) -> Vec<u8> {
+        self.to_bytes().to_vec()
+    }
+
+    /// Construct from raw 16 bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            uuid: uuid::Uuid::from_bytes(bytes),
+            _tag: PhantomData,
+        }
     }
 }
 

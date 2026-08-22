@@ -84,7 +84,7 @@ impl BackendImpl {
 
     async fn load_many<T: Persistent>(
         &self,
-        ids: &[Vec<u8>],
+        ids: &[[u8; 16]],
         codec: Codec,
     ) -> Result<Vec<T>, StoreError> {
         match self {
@@ -186,7 +186,7 @@ impl BackendImpl {
     async fn replace_where<T: Persistent>(
         &self,
         filters: &[(String, String)],
-        items: &[(Vec<u8>, Vec<u8>, Vec<String>)],
+        items: &[([u8; 16], Vec<u8>, Vec<String>)],
         codec: Codec,
     ) -> Result<(), StoreError> {
         match self {
@@ -271,7 +271,7 @@ impl StoreBuilder {
         self
     }
 
-    /// Set the connection pool size (`SQLite` only — reserved for future use).
+    /// Set the connection pool size (`SQLite` / `Postgres`).
     #[must_use]
     pub fn pool_size(mut self, n: u32) -> Self {
         self.pool_size = Some(n);
@@ -281,15 +281,15 @@ impl StoreBuilder {
     /// Open the store with the configured options.
     pub async fn open(self) -> Result<Store, StoreError> {
         let inner = match self.backend {
-            BackendKind::Sqlite => {
-                BackendImpl::Sqlite(Arc::new(SqliteBackend::open(&self.path).await?))
-            }
+            BackendKind::Sqlite => BackendImpl::Sqlite(Arc::new(
+                SqliteBackend::open_with_pool(&self.path, self.pool_size).await?,
+            )),
             #[cfg(feature = "redb")]
             BackendKind::Redb => BackendImpl::Redb(Arc::new(RedbBackend::open(&self.path).await?)),
             #[cfg(feature = "postgres")]
-            BackendKind::Postgres => {
-                BackendImpl::Postgres(Arc::new(PostgresBackend::open(&self.path).await?))
-            }
+            BackendKind::Postgres => BackendImpl::Postgres(Arc::new(
+                PostgresBackend::open_with_pool(&self.path, self.pool_size).await?,
+            )),
         };
         Ok(Store {
             inner,
@@ -386,7 +386,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let id_bytes: Vec<Vec<u8>> = ids
+        let id_bytes: Vec<[u8; 16]> = ids
             .iter()
             .map(|id| id.clone().into_air_id().to_bytes())
             .collect();

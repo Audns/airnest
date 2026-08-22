@@ -5,10 +5,9 @@
 //! owns only the connection pool, bind execution, and PG-specific glue.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
-use tokio::sync::Mutex;
 
 use crate::{
     backend::{
@@ -24,7 +23,8 @@ use crate::{
 #[derive(Clone)]
 pub struct PostgresBackend {
     pool: PgPool,
-    tables: Arc<Mutex<HashSet<&'static str>>>,
+    tables: Arc<RwLock<HashSet<&'static str>>>,
+    upsert_cache: Arc<RwLock<HashMap<String, String>>>,
     dialect: Arc<dyn SqlDialect>,
 }
 
@@ -34,8 +34,14 @@ impl PostgresBackend {
     /// `url` is a standard `postgres://` or `postgresql://` connection URL,
     /// e.g. `"postgres://user:pass@host:5432/dbname"`.
     pub async fn open(url: &str) -> Result<Self, StoreError> {
+        Self::open_with_pool(url, None).await
+    }
+
+    pub async fn open_with_pool(url: &str, pool_size: Option<u32>) -> Result<Self, StoreError> {
+        let max_conns = pool_size.unwrap_or(10);
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(max_conns)
+            .acquire_timeout(std::time::Duration::from_secs(5))
             .connect(url)
             .await?;
 
@@ -48,9 +54,23 @@ impl PostgresBackend {
 
         Ok(Self {
             pool,
-            tables: Arc::new(Mutex::new(HashSet::new())),
+            tables: Arc::new(RwLock::new(HashSet::new())),
+            upsert_cache: Arc::new(RwLock::new(HashMap::new())),
             dialect,
         })
+    }
+
+    fn cached_upsert(&self, schema: &TableSchema) -> String {
+        if let Ok(cache) = self.upsert_cache.read() {
+            if let Some(sql) = cache.get(schema.table) {
+                return sql.clone();
+            }
+        }
+        let sql = self.dialect.render_upsert(schema);
+        if let Ok(mut cache) = self.upsert_cache.write() {
+            cache.insert(schema.table.to_string(), sql.clone());
+        }
+        sql
     }
 
     async fn ensure_table_raw(
@@ -59,7 +79,7 @@ impl PostgresBackend {
         index_cols: &[&'static str],
     ) -> Result<(), StoreError> {
         {
-            let guard = self.tables.lock().await;
+            let guard = self.tables.read().map_err(|_| StoreError::Poisoned)?;
             if guard.contains(table) {
                 return Ok(());
             }
@@ -95,8 +115,16 @@ impl PostgresBackend {
                 .await?;
         }
 
-        let mut guard = self.tables.lock().await;
-        guard.insert(table);
+        // Cache upsert SQL
+        let upsert_sql = self.dialect.render_upsert(&schema);
+        if let Ok(mut cache) = self.upsert_cache.write() {
+            cache.insert(table.to_string(), upsert_sql);
+        }
+
+        let mut guard = self.tables.write().map_err(|_| StoreError::Poisoned)?;
+        if !guard.contains(table) {
+            guard.insert(table);
+        }
         Ok(())
     }
 
@@ -138,10 +166,10 @@ impl Backend for PostgresBackend {
             table,
             index_columns: index_cols,
         };
-        let sql = self.dialect.render_upsert(&schema);
+        let sql = self.cached_upsert(&schema);
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-        query = query.bind(&id_bytes).bind(&v);
+        query = query.bind(&id_bytes[..]).bind(&v);
         for val in index_vals {
             query = query.bind(val);
         }
@@ -177,7 +205,7 @@ impl Backend for PostgresBackend {
 
     async fn load_many<T: Persistent>(
         &self,
-        ids: &[Vec<u8>],
+        ids: &[[u8; 16]],
         codec: Codec,
     ) -> Result<Vec<T>, StoreError> {
         let table = T::TABLE;
@@ -185,25 +213,28 @@ impl Backend for PostgresBackend {
             return Ok(vec![]);
         }
 
-        let sql = self.select_in_sql(table, "id", ids.len());
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-        for id in ids {
-            query = query.bind(id);
-        }
+        const CHUNK: usize = 500;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let sql = self.select_in_sql(table, "id", chunk.len());
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in chunk {
+                query = query.bind(&id[..]);
+            }
 
-        let rows = query.fetch_all(&self.pool).await?;
-        rows.into_iter()
-            .map(|r| {
+            let rows = query.fetch_all(&self.pool).await?;
+            for r in rows {
                 let bytes: Vec<u8> = r.get(0);
-                codec.decode(&bytes)
-            })
-            .collect::<Result<Vec<T>, _>>()
+                out.push(codec.decode(&bytes)?);
+            }
+        }
+        Ok(out)
     }
 
     async fn exists<T: Persistent>(&self, id_bytes: &[u8]) -> Result<bool, StoreError> {
         let table = T::TABLE;
         let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE {} = {}",
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {} = {})",
             self.quote(table),
             self.quote("id"),
             self.ph(1),
@@ -213,8 +244,8 @@ impl Backend for PostgresBackend {
             .fetch_one(&self.pool)
             .await?;
 
-        let n: i64 = row.get(0);
-        Ok(n > 0)
+        let exists: bool = row.get(0);
+        Ok(exists)
     }
 
     async fn delete<T: Persistent>(&self, id_bytes: &[u8]) -> Result<(), StoreError> {
@@ -330,7 +361,7 @@ impl Backend for PostgresBackend {
     async fn replace_where<T: Persistent>(
         &self,
         filters: &[(String, String)],
-        items: &[(Vec<u8>, Vec<u8>, Vec<String>)],
+        items: &[([u8; 16], Vec<u8>, Vec<String>)],
         codec: Codec,
     ) -> Result<(), StoreError> {
         let table = T::TABLE;
@@ -358,7 +389,7 @@ impl Backend for PostgresBackend {
         for (id_bytes, value_bytes, index_values) in items {
             batch.entries.push(crate::backend::BatchEntry {
                 table,
-                id_bytes: id_bytes.clone(),
+                id_bytes: *id_bytes,
                 value_bytes: value_bytes.clone(),
                 index_columns: T::index_columns(),
                 index_values: index_values.clone(),
@@ -376,16 +407,37 @@ impl Backend for PostgresBackend {
             }
         }
 
+        let mut sql_cache: HashMap<&'static str, String> = HashMap::new();
+        for entry in &batch.entries {
+            if !sql_cache.contains_key(entry.table) {
+                let cached = if let Ok(c) = self.upsert_cache.read() {
+                    c.get(entry.table).cloned()
+                } else {
+                    None
+                };
+                let sql = if let Some(s) = cached {
+                    s
+                } else {
+                    let schema = TableSchema {
+                        table: entry.table,
+                        index_columns: entry.index_columns,
+                    };
+                    let s = self.dialect.render_upsert(&schema);
+                    if let Ok(mut c) = self.upsert_cache.write() {
+                        c.insert(entry.table.to_string(), s.clone());
+                    }
+                    s
+                };
+                sql_cache.insert(entry.table, sql);
+            }
+        }
+
         let mut tx = self.pool.begin().await?;
 
         for entry in &batch.entries {
-            let schema = TableSchema {
-                table: entry.table,
-                index_columns: entry.index_columns,
-            };
-            let sql = self.dialect.render_upsert(&schema);
+            let sql = sql_cache.get(entry.table).expect("sql cached");
             let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-            query = query.bind(&entry.id_bytes).bind(&entry.value_bytes);
+            query = query.bind(&entry.id_bytes[..]).bind(&entry.value_bytes);
             for val in &entry.index_values {
                 query = query.bind(val);
             }

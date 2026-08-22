@@ -1,10 +1,9 @@
 //! Redb backend implementation.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use tokio::sync::Mutex;
 
 use crate::{
     backend::{Backend, BackendBatch, BatchEntry, Filter, Order, QueryRequest},
@@ -18,7 +17,7 @@ const KV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("airnest_kv
 /// Wrapper stored in redb to keep metadata alongside the user blob.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Record {
-    id: Vec<u8>,
+    id: [u8; 16],
     bytes: Vec<u8>,
     saved_at: u64,
     index_values: HashMap<String, String>,
@@ -27,7 +26,7 @@ struct Record {
 #[derive(Clone)]
 pub struct RedbBackend {
     db: Arc<Database>,
-    tables: Arc<Mutex<HashSet<&'static str>>>,
+    tables: Arc<RwLock<HashSet<&'static str>>>,
 }
 
 impl RedbBackend {
@@ -41,7 +40,7 @@ impl RedbBackend {
 
         let backend = Self {
             db: Arc::new(db),
-            tables: Arc::new(Mutex::new(HashSet::new())),
+            tables: Arc::new(RwLock::new(HashSet::new())),
         };
 
         // Ensure the main table exists.
@@ -117,7 +116,7 @@ impl RedbBackend {
 
 impl Backend for RedbBackend {
     async fn ensure_table<T: Persistent>(&self) -> Result<(), StoreError> {
-        let mut guard = self.tables.lock().await;
+        let mut guard = self.tables.write().map_err(|_| StoreError::Poisoned)?;
         guard.insert(T::TABLE);
         Ok(())
     }
@@ -193,7 +192,7 @@ impl Backend for RedbBackend {
 
     async fn load_many<T: Persistent>(
         &self,
-        ids: &[Vec<u8>],
+        ids: &[[u8; 16]],
         codec: Codec,
     ) -> Result<Vec<T>, StoreError> {
         let table = T::TABLE;
@@ -352,12 +351,23 @@ impl Backend for RedbBackend {
                     recs.retain(|r| r.index_values.get(col) == Some(val));
                 }
                 Filter::In(col, vals) => {
-                    recs.retain(|r| {
-                        r.index_values
-                            .get(col)
-                            .map(|v| vals.contains(v))
-                            .unwrap_or(false)
-                    });
+                    // Use HashSet for O(1) lookups when vals is large.
+                    if vals.len() > 8 {
+                        let set: HashSet<&String> = vals.iter().collect();
+                        recs.retain(|r| {
+                            r.index_values
+                                .get(col)
+                                .map(|v| set.contains(v))
+                                .unwrap_or(false)
+                        });
+                    } else {
+                        recs.retain(|r| {
+                            r.index_values
+                                .get(col)
+                                .map(|v| vals.contains(v))
+                                .unwrap_or(false)
+                        });
+                    }
                 }
             }
         }
@@ -392,11 +402,13 @@ impl Backend for RedbBackend {
                     Filter::Eq(col, val) => {
                         if rec.index_values.get(col) != Some(val) {
                             keep = false;
+                            break;
                         }
                     }
                     Filter::In(col, vals) => {
                         if !vals.contains(rec.index_values.get(col).unwrap_or(&String::new())) {
                             keep = false;
+                            break;
                         }
                     }
                 }
@@ -425,7 +437,7 @@ impl Backend for RedbBackend {
     async fn replace_where<T: Persistent>(
         &self,
         filters: &[(String, String)],
-        items: &[(Vec<u8>, Vec<u8>, Vec<String>)],
+        items: &[([u8; 16], Vec<u8>, Vec<String>)],
         codec: Codec,
     ) -> Result<(), StoreError> {
         let table = T::TABLE;
@@ -468,7 +480,7 @@ impl Backend for RedbBackend {
         for (id_bytes, value_bytes, index_values) in items {
             batch.entries.push(BatchEntry {
                 table,
-                id_bytes: id_bytes.clone(),
+                id_bytes: *id_bytes,
                 value_bytes: value_bytes.clone(),
                 index_columns: T::index_columns(),
                 index_values: index_values.clone(),
@@ -488,7 +500,7 @@ impl Backend for RedbBackend {
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect();
             let rec = Record {
-                id: e.id_bytes.clone(),
+                id: e.id_bytes,
                 bytes: e.value_bytes.clone(),
                 saved_at: 0,
                 index_values: index_map,

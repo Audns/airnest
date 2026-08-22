@@ -40,6 +40,11 @@ impl SqlDialect for SqliteDialect {
             "PRAGMA journal_mode=WAL",
             "PRAGMA synchronous=NORMAL",
             "PRAGMA foreign_keys=OFF",
+            "PRAGMA cache_size=-64000",
+            "PRAGMA temp_store=MEMORY",
+            "PRAGMA busy_timeout=5000",
+            "PRAGMA wal_autocheckpoint=1000",
+            "PRAGMA mmap_size=268435456",
         ]
     }
 
@@ -238,10 +243,13 @@ mod tests {
     #[test]
     fn session_init_sql_has_three_pragmas() {
         let stmts = d().session_init_sql();
-        assert_eq!(stmts.len(), 3);
-        assert!(stmts[0].contains("journal_mode"));
-        assert!(stmts[1].contains("synchronous"));
-        assert!(stmts[2].contains("foreign_keys"));
+        assert!(stmts.len() >= 3);
+        assert!(stmts.iter().any(|s| s.contains("journal_mode")));
+        assert!(stmts.iter().any(|s| s.contains("synchronous")));
+        assert!(stmts.iter().any(|s| s.contains("foreign_keys")));
+        // Tuned pragmas for throughput
+        assert!(stmts.iter().any(|s| s.contains("cache_size")));
+        assert!(stmts.iter().any(|s| s.contains("busy_timeout")));
     }
 
     // ── identifier / placeholder ─────────────────────────────────────────

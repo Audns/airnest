@@ -49,7 +49,7 @@ pub struct QueryRequest {
 #[derive(Debug, Clone)]
 pub struct BatchEntry {
     pub table: &'static str,
-    pub id_bytes: Vec<u8>,
+    pub id_bytes: [u8; 16],
     pub value_bytes: Vec<u8>,
     pub index_columns: &'static [&'static str],
     pub index_values: Vec<String>,
@@ -79,7 +79,7 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn load_many<T: Persistent>(
         &self,
-        ids: &[Vec<u8>],
+        ids: &[[u8; 16]],
         codec: Codec,
     ) -> Result<Vec<T>, StoreError>;
 
@@ -109,7 +109,7 @@ pub trait Backend: Send + Sync + 'static {
     async fn replace_where<T: Persistent>(
         &self,
         filters: &[(String, String)],
-        items: &[(Vec<u8>, Vec<u8>, Vec<String>)],
+        items: &[([u8; 16], Vec<u8>, Vec<String>)],
         codec: Codec,
     ) -> Result<(), StoreError>;
 

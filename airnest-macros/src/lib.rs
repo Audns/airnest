@@ -543,28 +543,47 @@ fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
 
 // ── attribute parser ──────────────────────────────────────────────────────────
 
-/// Parsed form of `#[persistent(index(a, b, c))]`.
+/// Parsed form of `#[persistent(index(a, b, c))]` with legacy `key = ...` support.
 struct PersistentArgs {
     indexes: Vec<String>,
 }
 
 impl Parse for PersistentArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let kw: syn::Ident = input.parse()?;
-        if kw != "index" {
-            return Err(syn::Error::new_spanned(
-                kw,
-                "expected `index(field, ...)`. Bare `#[persistent]` needs no arguments.",
-            ));
-        }
-        let content;
-        syn::parenthesized!(content in input);
+        // Support legacy `key = <ident>` (ignored — new `id` is the PK) and `index(...)`.
         let mut indexes = Vec::new();
-        while !content.is_empty() {
-            let ident: syn::Ident = content.parse()?;
-            indexes.push(ident.to_string());
-            if content.peek(Token![,]) {
-                content.parse::<Token![,]>()?;
+        while !input.is_empty() {
+            if input.peek(syn::Ident) {
+                let lookahead = input.fork();
+                let ident: syn::Ident = lookahead.parse().unwrap();
+                if ident == "key" {
+                    let _: syn::Ident = input.parse()?;
+                    input.parse::<Token![=]>()?;
+                    let _: syn::Ident = input.parse()?;
+                    if input.peek(Token![,]) {
+                        input.parse::<Token![,]>()?;
+                    }
+                    continue;
+                }
+            }
+            let kw: syn::Ident = input.parse()?;
+            if kw != "index" {
+                return Err(syn::Error::new_spanned(
+                    kw,
+                    "expected `index(field, ...)`. Bare `#[persistent]` needs no arguments.",
+                ));
+            }
+            let content;
+            syn::parenthesized!(content in input);
+            while !content.is_empty() {
+                let ident: syn::Ident = content.parse()?;
+                indexes.push(ident.to_string());
+                if content.peek(Token![,]) {
+                    content.parse::<Token![,]>()?;
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
             }
         }
         Ok(Self { indexes })
