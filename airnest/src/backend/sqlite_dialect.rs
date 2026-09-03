@@ -98,6 +98,21 @@ impl SqlDialect for SqliteDialect {
         )
     }
 
+    fn render_create_unique_index(&self, table: &str, columns: &[&str]) -> String {
+        let idx_name = format!("{table}_{}_uniq", columns.join("_"));
+        let cols = columns
+            .iter()
+            .map(|c| self.quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {}\n    ON {} ({})",
+            self.quote_ident(&idx_name),
+            self.quote_ident(table),
+            cols,
+        )
+    }
+
     fn render_upsert(&self, schema: &TableSchema) -> String {
         let TableSchema {
             table,
@@ -135,6 +150,57 @@ impl SqlDialect for SqliteDialect {
              ON CONFLICT(id) DO UPDATE SET\n\
              \x20\x20\x20\x20v = excluded.v,\n\
              \x20\x20\x20\x20saved_at = excluded.saved_at{updates}",
+        )
+    }
+
+    fn render_insert_guarded(
+        &self,
+        schema: &TableSchema,
+        partition: &[&str],
+        sequence_column: &str,
+    ) -> String {
+        let TableSchema {
+            table,
+            index_columns,
+        } = *schema;
+        let quoted_table = self.quote_ident(table);
+        let now = self.current_epoch_seconds_expr();
+
+        // Bind order: id ?1, v ?2, index values ?3.., partition values..,
+        // sequence value last. Non-numeric sequence cells CAST to 0, matching
+        // the application's unwrap_or(0) convention.
+        let mut next = 3;
+        let mut placeholders = String::new();
+        for _ in index_columns.iter() {
+            let _ = write!(placeholders, ", {}", self.placeholder(next));
+            next += 1;
+        }
+        let mut guards = Vec::with_capacity(partition.len() + 1);
+        for col in partition {
+            guards.push(format!(
+                "{} = {}",
+                self.quote_ident(col),
+                self.placeholder(next)
+            ));
+            next += 1;
+        }
+        guards.push(format!(
+            "CAST({} AS INTEGER) >= {}",
+            self.quote_ident(sequence_column),
+            self.placeholder(next)
+        ));
+        let where_clause = guards.join(" AND ");
+
+        let mut col_list = String::new();
+        for col in index_columns.iter() {
+            let _ = write!(col_list, ", {}", self.quote_ident(col));
+        }
+        format!(
+            "INSERT INTO {quoted_table} (id, v, saved_at{col_list})\n\
+             SELECT ?1, ?2, {now}{placeholders}\n\
+             WHERE NOT EXISTS (\n\
+             \x20\x20\x20\x20SELECT 1 FROM {quoted_table} WHERE {where_clause}\n\
+             )",
         )
     }
 
@@ -316,6 +382,32 @@ mod tests {
         let sql = d().render_create_index("Job", "status");
         assert!(sql.starts_with("CREATE INDEX IF NOT EXISTS \"Job_status_idx\""));
         assert!(sql.contains("ON \"Job\" (\"status\")"));
+    }
+
+    #[test]
+    fn create_unique_index_names_groups_deterministically() {
+        let sql = d().render_create_unique_index("Revision", &["session_id", "generation"]);
+        assert_eq!(
+            sql,
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"Revision_session_id_generation_uniq\"\n    ON \"Revision\" (\"session_id\", \"generation\")"
+        );
+        let single = d().render_create_unique_index("Job", &["name"]);
+        assert!(single.starts_with("CREATE UNIQUE INDEX IF NOT EXISTS \"Job_name_uniq\""));
+    }
+
+    #[test]
+    fn insert_guarded_binds_id_v_indexes_partition_then_sequence() {
+        let schema = TableSchema {
+            table: "Revision",
+            index_columns: &["session_id", "generation"],
+        };
+        let sql = d().render_insert_guarded(&schema, &["session_id"], "generation");
+        // id ?1, v ?2, two index values ?3 ?4, one partition value ?5,
+        // sequence value ?6 — in exactly this order.
+        assert!(sql.contains("SELECT ?1, ?2, unixepoch(), ?3, ?4"));
+        assert!(sql.contains("\"session_id\" = ?5"));
+        assert!(sql.contains("CAST(\"generation\" AS INTEGER) >= ?6"));
+        assert!(sql.contains("WHERE NOT EXISTS"));
     }
 
     // ── DML: upsert ──────────────────────────────────────────────────────

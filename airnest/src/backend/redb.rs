@@ -3,16 +3,112 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, Table, TableDefinition};
 
 use crate::{
-    backend::{Backend, BackendBatch, BatchEntry, Filter, Order, QueryRequest},
+    backend::{
+        Backend, BackendBatch, BatchEntry, Filter, GuardOutcome, Order, QueryRequest, SequenceGuard,
+    },
     codec::Codec,
     error::StoreError,
     persistent::Persistent,
 };
 
 const KV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("airnest_kv");
+
+/// Secondary index for uniqueness groups: key → owning record id.
+///
+/// Key layout is `table_bytes + 0x00 + bitcode((group_columns, values))`,
+/// so per-table cleanup is a byte-prefix scan and arbitrary strings
+/// round-trip exactly. All reads and writes happen inside the caller's
+/// write transaction, keeping check-and-insert atomic.
+const UQ_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("airnest_uq");
+
+/// Encode one uniqueness-group key for `record`'s index map.
+fn unique_key(
+    table: &str,
+    cols: &[&str],
+    index_map: &HashMap<String, String>,
+) -> Result<Vec<u8>, StoreError> {
+    let vals: Vec<String> = cols
+        .iter()
+        .map(|c| index_map.get(*c).cloned().unwrap_or_default())
+        .collect();
+    let mut key = Vec::with_capacity(table.len() + 1 + 64);
+    key.extend_from_slice(table.as_bytes());
+    key.push(0);
+    let tail = bitcode::serialize(&(cols, vals)).map_err(StoreError::Encode)?;
+    key.extend_from_slice(&tail);
+    Ok(key)
+}
+
+fn unique_table_prefix(table: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut start = table.as_bytes().to_vec();
+    start.push(0);
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
+/// Check-and-insert every uniqueness group for one record, and drop stale
+/// keys the record no longer claims (upserts that change indexed values).
+/// Must run inside the caller's write transaction: the check and the
+/// insert are then atomic, and a lost race surfaces as [`StoreError::Conflict`].
+fn sync_unique_keys(
+    uq: &mut Table<'_, &[u8], &[u8]>,
+    table: &'static str,
+    groups: &[&[&str]],
+    old: Option<&HashMap<String, String>>,
+    new: &HashMap<String, String>,
+    id: &[u8; 16],
+) -> Result<(), StoreError> {
+    let mut fresh = Vec::with_capacity(groups.len());
+    for cols in groups {
+        let key = unique_key(table, cols, new)?;
+        match uq
+            .get(key.as_slice())
+            .map_err(|e| StoreError::Redb(e.to_string()))?
+        {
+            Some(owner) if owner.value() != id.as_slice() => {
+                return Err(StoreError::Conflict(format!(
+                    "duplicate value for unique({}) on `{table}`",
+                    cols.join(", "),
+                )));
+            }
+            _ => {}
+        }
+        fresh.push(key);
+    }
+    if let Some(old_map) = old {
+        for cols in groups {
+            let stale = unique_key(table, cols, old_map)?;
+            if !fresh.iter().any(|k| k == &stale) {
+                uq.remove(stale.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+            }
+        }
+    }
+    for key in fresh {
+        uq.insert(key.as_slice(), id.as_slice())
+            .map_err(|e| StoreError::Redb(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Drop every uniqueness key a record claims (delete path).
+fn remove_unique_keys(
+    uq: &mut Table<'_, &[u8], &[u8]>,
+    table: &'static str,
+    groups: &[&[&str]],
+    index_map: &HashMap<String, String>,
+) -> Result<(), StoreError> {
+    for cols in groups {
+        let key = unique_key(table, cols, index_map)?;
+        uq.remove(key.as_slice())
+            .map_err(|e| StoreError::Redb(e.to_string()))?;
+    }
+    Ok(())
+}
 
 /// Wrapper stored in redb to keep metadata alongside the user blob.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -135,9 +231,10 @@ impl Backend for RedbBackend {
             id: id_bytes,
             bytes: value_bytes,
             saved_at: 0,
-            index_values,
+            index_values: index_values.clone(),
         };
         let record_bytes = bitcode::serialize(&record).map_err(StoreError::Encode)?;
+        let groups = T::unique_constraints();
 
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
@@ -148,6 +245,18 @@ impl Backend for RedbBackend {
                 let mut tbl = txn
                     .open_table(KV_TABLE)
                     .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let mut uq = txn
+                    .open_table(UQ_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let old: Option<HashMap<String, String>> = tbl
+                    .get(key.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?
+                    .map(|v| {
+                        bitcode::deserialize::<Record>(v.value())
+                            .map(|r| r.index_values)
+                            .unwrap_or_default()
+                    });
+                sync_unique_keys(&mut uq, table, groups, old.as_ref(), &index_values, &id_bytes)?;
                 tbl.insert(key.as_slice(), record_bytes.as_slice())
                     .map_err(|e| StoreError::Redb(e.to_string()))?;
             }
@@ -251,6 +360,7 @@ impl Backend for RedbBackend {
     async fn delete<T: Persistent>(&self, id_bytes: &[u8]) -> Result<(), StoreError> {
         let table = T::TABLE;
         let key = Self::make_key(table, id_bytes);
+        let groups = T::unique_constraints();
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let txn = db
@@ -260,8 +370,20 @@ impl Backend for RedbBackend {
                 let mut tbl = txn
                     .open_table(KV_TABLE)
                     .map_err(|e| StoreError::Redb(e.to_string()))?;
-                tbl.remove(key.as_slice())
+                let mut uq = txn
+                    .open_table(UQ_TABLE)
                     .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let previous: Option<Vec<u8>> = tbl
+                    .get(key.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?
+                    .map(|found| found.value().to_vec());
+                if let Some(bytes) = previous {
+                    if let Ok(rec) = bitcode::deserialize::<Record>(&bytes) {
+                        remove_unique_keys(&mut uq, table, groups, &rec.index_values)?;
+                    }
+                    tbl.remove(key.as_slice())
+                        .map_err(|e| StoreError::Redb(e.to_string()))?;
+                }
             }
             txn.commit().map_err(|e| StoreError::Redb(e.to_string()))?;
             Ok::<_, StoreError>(())
@@ -273,6 +395,7 @@ impl Backend for RedbBackend {
     async fn delete_all<T: Persistent>(&self) -> Result<u64, StoreError> {
         let table = T::TABLE;
         let (start, end) = Self::table_range(table);
+        let (uq_start, uq_end) = unique_table_prefix(table);
         let db = self.db.clone();
         let count = tokio::task::spawn_blocking(move || {
             let txn = db
@@ -294,6 +417,22 @@ impl Backend for RedbBackend {
                     tbl.remove(key.as_slice())
                         .map_err(|e| StoreError::Redb(e.to_string()))?;
                     removed += 1;
+                }
+            }
+            {
+                let mut uq = txn
+                    .open_table(UQ_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let range = uq
+                    .range(uq_start.as_slice()..=uq_end.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let keys: Vec<Vec<u8>> = range
+                    .map(|item| item.map(|(k, _v)| k.value().to_vec()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                for key in keys {
+                    uq.remove(key.as_slice())
+                        .map_err(|e| StoreError::Redb(e.to_string()))?;
                 }
             }
             txn.commit().map_err(|e| StoreError::Redb(e.to_string()))?;
@@ -420,6 +559,70 @@ impl Backend for RedbBackend {
         Ok(count)
     }
 
+    async fn query_projected(
+        &self,
+        request: QueryRequest,
+        columns: &[String],
+    ) -> Result<Vec<crate::backend::ProjectedRow>, StoreError> {
+        let mut recs = self.scan_records(request.table).await?;
+
+        for filter in &request.filters {
+            match filter {
+                Filter::Eq(col, val) => {
+                    recs.retain(|r| r.index_values.get(col) == Some(val));
+                }
+                Filter::In(col, vals) => {
+                    recs.retain(|r| {
+                        r.index_values
+                            .get(col)
+                            .map(|v| vals.contains(v))
+                            .unwrap_or(false)
+                    });
+                }
+            }
+        }
+
+        for (col, order) in request.order_by.iter().rev() {
+            recs.sort_by(|a, b| {
+                let av = a.index_values.get(col);
+                let bv = b.index_values.get(col);
+                match order {
+                    Order::Asc => av.cmp(&bv),
+                    Order::Desc => bv.cmp(&av),
+                }
+            });
+        }
+
+        if let Some(n) = request.limit {
+            recs.truncate(n);
+        }
+
+        // Index values only: the blob is never touched.
+        Ok(recs
+            .into_iter()
+            .map(|rec| {
+                let values = columns
+                    .iter()
+                    .map(|c| {
+                        if c == "id" {
+                            Some(
+                                uuid::Uuid::from_bytes(rec.id)
+                                    .as_simple()
+                                    .to_string(),
+                            )
+                        } else {
+                            rec.index_values.get(c).cloned()
+                        }
+                    })
+                    .collect();
+                crate::backend::ProjectedRow {
+                    columns: columns.to_vec(),
+                    values,
+                }
+            })
+            .collect())
+    }
+
     async fn count_grouped_by<T: Persistent>(
         &self,
         column: &str,
@@ -441,6 +644,7 @@ impl Backend for RedbBackend {
         codec: Codec,
     ) -> Result<(), StoreError> {
         let table = T::TABLE;
+        let groups = T::unique_constraints();
         let pairs = self.scan_pairs(table).await?;
         let mut to_delete = Vec::new();
         for (key, rec) in pairs {
@@ -452,7 +656,7 @@ impl Backend for RedbBackend {
                 }
             }
             if matches {
-                to_delete.push(key);
+                to_delete.push((key, rec.index_values));
             }
         }
 
@@ -465,7 +669,11 @@ impl Backend for RedbBackend {
                 let mut tbl = txn
                     .open_table(KV_TABLE)
                     .map_err(|e| StoreError::Redb(e.to_string()))?;
-                for key in to_delete {
+                let mut uq = txn
+                    .open_table(UQ_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                for (key, index_values) in to_delete {
+                    remove_unique_keys(&mut uq, table, groups, &index_values)?;
                     tbl.remove(key.as_slice())
                         .map_err(|e| StoreError::Redb(e.to_string()))?;
                 }
@@ -484,6 +692,7 @@ impl Backend for RedbBackend {
                 value_bytes: value_bytes.clone(),
                 index_columns: T::index_columns(),
                 index_values: index_values.clone(),
+                unique_groups: T::unique_constraints(),
             });
         }
         self.save_batch(&batch, codec).await
@@ -507,7 +716,14 @@ impl Backend for RedbBackend {
             };
             let rec_bytes = bitcode::serialize(&rec).map_err(StoreError::Encode)?;
             let key = Self::make_key(e.table, &e.id_bytes);
-            entries.push((key, rec_bytes));
+            entries.push((
+                e.table,
+                e.unique_groups,
+                e.id_bytes,
+                key,
+                rec_bytes,
+                rec.index_values,
+            ));
         }
 
         tokio::task::spawn_blocking(move || {
@@ -518,7 +734,19 @@ impl Backend for RedbBackend {
                 let mut tbl = txn
                     .open_table(KV_TABLE)
                     .map_err(|e| StoreError::Redb(e.to_string()))?;
-                for (key, rec_bytes) in entries {
+                let mut uq = txn
+                    .open_table(UQ_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                for (table, groups, id_bytes, key, rec_bytes, index_map) in entries {
+                    let old: Option<HashMap<String, String>> = tbl
+                        .get(key.as_slice())
+                        .map_err(|e| StoreError::Redb(e.to_string()))?
+                        .map(|v| {
+                            bitcode::deserialize::<Record>(v.value())
+                                .map(|r| r.index_values)
+                                .unwrap_or_default()
+                        });
+                    sync_unique_keys(&mut uq, table, groups, old.as_ref(), &index_map, &id_bytes)?;
                     tbl.insert(key.as_slice(), rec_bytes.as_slice())
                         .map_err(|e| StoreError::Redb(e.to_string()))?;
                 }
@@ -532,6 +760,96 @@ impl Backend for RedbBackend {
 
     fn as_sqlite_pool(&self) -> Option<&sqlx::SqlitePool> {
         None
+    }
+
+    async fn insert_guarded<T: Persistent>(
+        &self,
+        value: &T,
+        guard: &SequenceGuard,
+        codec: Codec,
+    ) -> Result<GuardOutcome, StoreError> {
+        let table = T::TABLE;
+        let id_bytes = value.id().to_bytes();
+        let key = Self::make_key(table, &id_bytes);
+        let value_bytes = codec.encode(value)?;
+        let index_map: HashMap<String, String> = T::index_columns()
+            .iter()
+            .zip(value.index_values().iter())
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        let record = Record {
+            id: id_bytes,
+            bytes: value_bytes,
+            saved_at: 0,
+            index_values: index_map,
+        };
+        let record_bytes = bitcode::serialize(&record).map_err(StoreError::Encode)?;
+        let groups = T::unique_constraints();
+        let partition = guard.partition.clone();
+        let seq_col = guard.sequence_column.clone();
+        let seq_val = guard.sequence_value;
+        let (start, end) = Self::table_range(table);
+
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let txn = db
+                .begin_write()
+                .map_err(|e| StoreError::Redb(e.to_string()))?;
+            // Check and insert share one write transaction: redb serializes
+            // writers, so no interleaving can slip a stale write through.
+            let blocked = {
+                let tbl = txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let range = tbl
+                    .range(start.as_slice()..=end.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let mut blocked = false;
+                for item in range {
+                    let (_k, v) = item.map_err(|e| StoreError::Redb(e.to_string()))?;
+                    let rec: Record =
+                        bitcode::deserialize(v.value()).map_err(StoreError::Encode)?;
+                    if partition
+                        .iter()
+                        .all(|(c, want)| rec.index_values.get(c) == Some(want))
+                        && let Some(have) = rec.index_values.get(&seq_col)
+                        && have.parse::<i64>().unwrap_or(0) >= seq_val
+                    {
+                        blocked = true;
+                        break;
+                    }
+                }
+                blocked
+            };
+            if blocked {
+                return Ok::<_, StoreError>(GuardOutcome::Rejected);
+            }
+            {
+                let mut tbl = txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let mut uq = txn
+                    .open_table(UQ_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let old: Option<HashMap<String, String>> = tbl
+                    .get(key.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?
+                    .map(|v| {
+                        bitcode::deserialize::<Record>(v.value())
+                            .map(|r| r.index_values)
+                            .unwrap_or_default()
+                    });
+                // A lost race on a UNIQUE group surfaces as Conflict, which
+                // the Store layer reports as Rejected.
+                sync_unique_keys(&mut uq, table, groups, old.as_ref(), &record.index_values, &id_bytes)?;
+                tbl.insert(key.as_slice(), record_bytes.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+            }
+            txn.commit().map_err(|e| StoreError::Redb(e.to_string()))?;
+            Ok::<_, StoreError>(GuardOutcome::Landed)
+        })
+        .await
+        .map_err(StoreError::Join)?
     }
 
     async fn query_raw<T: Persistent>(

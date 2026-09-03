@@ -23,6 +23,7 @@ pub use index::ToIndexValue;
 pub use into_air_id::IntoAirId;
 pub use persistent::Persistent;
 pub use serde_helpers::{json_de, json_ser, json_string};
+pub use backend::{GuardOutcome, ProjectedRow, SequenceGuard};
 pub use store::{
     BackendKind, InitMany, Query, ReplaceBuilder, Store, StoreBatch, UpsertBuilder,
     UpsertModifyBuilder,

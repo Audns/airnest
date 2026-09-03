@@ -11,7 +11,7 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 
 use crate::{
     backend::{
-        Backend, BackendBatch, Filter, QueryRequest,
+        Backend, BackendBatch, Filter, GuardOutcome, QueryRequest, SequenceGuard,
         dialect::{SqlDialect, TableSchema},
         postgres_dialect::PostgresDialect,
     },
@@ -77,6 +77,7 @@ impl PostgresBackend {
         &self,
         table: &'static str,
         index_cols: &[&'static str],
+        unique: &[&[&str]],
     ) -> Result<(), StoreError> {
         {
             let guard = self.tables.read().map_err(|_| StoreError::Poisoned)?;
@@ -111,6 +112,13 @@ impl PostgresBackend {
         for col in index_cols {
             let col_idx_sql = self.dialect.render_create_index(table, col);
             sqlx::query(sqlx::AssertSqlSafe(&*col_idx_sql))
+                .execute(&self.pool)
+                .await?;
+        }
+
+        for group in unique {
+            let uniq_sql = self.dialect.render_create_unique_index(table, group);
+            sqlx::query(sqlx::AssertSqlSafe(&*uniq_sql))
                 .execute(&self.pool)
                 .await?;
         }
@@ -151,12 +159,14 @@ impl PostgresBackend {
 
 impl Backend for PostgresBackend {
     async fn ensure_table<T: Persistent>(&self) -> Result<(), StoreError> {
-        self.ensure_table_raw(T::TABLE, T::index_columns()).await
+        self.ensure_table_raw(T::TABLE, T::index_columns(), T::unique_constraints())
+            .await
     }
 
     async fn save<T: Persistent>(&self, value: &T, codec: Codec) -> Result<(), StoreError> {
         let table = T::TABLE;
-        self.ensure_table_raw(table, T::index_columns()).await?;
+        self.ensure_table_raw(table, T::index_columns(), T::unique_constraints())
+            .await?;
         let id_bytes = value.id().to_bytes();
         let v = codec.encode(value)?;
         let index_cols = T::index_columns();
@@ -334,6 +344,51 @@ impl Backend for PostgresBackend {
         Ok(n)
     }
 
+    async fn query_projected(
+        &self,
+        request: QueryRequest,
+        columns: &[String],
+    ) -> Result<Vec<crate::backend::ProjectedRow>, StoreError> {
+        let clause = format!(
+            "SELECT {}",
+            columns
+                .iter()
+                .map(|c| self.quote(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let rendered = self.dialect.render_select(&request, &clause);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(rendered.sql.as_str()));
+        for p in rendered.binds {
+            query = query.bind(p);
+        }
+
+        let rows = query.fetch_all(&self.pool).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mut values = Vec::with_capacity(columns.len());
+            for (i, col) in columns.iter().enumerate() {
+                if col == "id" {
+                    let raw: Vec<u8> = r.try_get(i).map_err(StoreError::Sqlite)?;
+                    let mut id = [0u8; 16];
+                    let len = raw.len().min(16);
+                    id[..len].copy_from_slice(&raw[..len]);
+                    values.push(Some(
+                        uuid::Uuid::from_bytes(id).as_simple().to_string(),
+                    ));
+                } else {
+                    let v: Option<String> = r.try_get(i).map_err(StoreError::Sqlite)?;
+                    values.push(v);
+                }
+            }
+            out.push(crate::backend::ProjectedRow {
+                columns: columns.to_vec(),
+                values,
+            });
+        }
+        Ok(out)
+    }
+
     async fn count_grouped_by<T: Persistent>(
         &self,
         column: &str,
@@ -393,6 +448,7 @@ impl Backend for PostgresBackend {
                 value_bytes: value_bytes.clone(),
                 index_columns: T::index_columns(),
                 index_values: index_values.clone(),
+                unique_groups: T::unique_constraints(),
             });
         }
         self.save_batch(&batch, codec).await
@@ -402,7 +458,7 @@ impl Backend for PostgresBackend {
         let mut seen = HashSet::new();
         for entry in &batch.entries {
             if seen.insert(entry.table) {
-                self.ensure_table_raw(entry.table, entry.index_columns)
+                self.ensure_table_raw(entry.table, entry.index_columns, entry.unique_groups)
                     .await?;
             }
         }
@@ -450,6 +506,44 @@ impl Backend for PostgresBackend {
 
     fn as_sqlite_pool(&self) -> Option<&sqlx::SqlitePool> {
         None
+    }
+
+    async fn insert_guarded<T: Persistent>(
+        &self,
+        value: &T,
+        guard: &SequenceGuard,
+        codec: Codec,
+    ) -> Result<GuardOutcome, StoreError> {
+        self.ensure_table::<T>().await?;
+        let id_bytes = value.id().to_bytes();
+        let v = codec.encode(value)?;
+        let index_vals = value.index_values();
+        let schema = TableSchema {
+            table: T::TABLE,
+            index_columns: T::index_columns(),
+        };
+        let partition: Vec<&str> = guard.partition.iter().map(|(c, _)| c.as_str()).collect();
+        let sql = self
+            .dialect
+            .render_insert_guarded(&schema, &partition, &guard.sequence_column);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        query = query.bind(&id_bytes[..]).bind(&v);
+        for val in index_vals {
+            query = query.bind(val);
+        }
+        for (_, val) in &guard.partition {
+            query = query.bind(val);
+        }
+        query = query.bind(guard.sequence_value);
+        match query.execute(&self.pool).await {
+            Ok(done) => Ok(if done.rows_affected() == 1 {
+                GuardOutcome::Landed
+            } else {
+                GuardOutcome::Rejected
+            }),
+            Err(e) if crate::backend::is_unique_violation(&e) => Ok(GuardOutcome::Rejected),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
     }
 
     async fn query_raw<T: Persistent>(

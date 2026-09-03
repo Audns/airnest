@@ -440,3 +440,97 @@ async fn pg_upsert_modifies_when_present() {
     assert_eq!(updated.payload, "old"); // payload not modified
     assert_eq!(s.count::<PgJob>().await.unwrap(), 1);
 }
+
+// ── A1: unique constraints ────────────────────────────────────────────────
+
+#[persistent(index(session_id), unique(session_id, generation))]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct PgRevision {
+    session_id: String,
+    generation: String,
+    body: String,
+}
+
+#[tokio::test]
+async fn pg_unique_constraint_rejects_duplicates_as_conflict() {
+    let s = store().await;
+    let _g = serial().await;
+    clean!(s, PgRevision);
+    s.save(&PgRevision::new("chat/a".into(), "1".into(), "first".into()))
+        .await
+        .unwrap();
+    let err = s
+        .save(&PgRevision::new("chat/a".into(), "1".into(), "second".into()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, airnest::StoreError::Conflict(_)),
+        "expected Conflict, got {err:?}"
+    );
+    s.save(&PgRevision::new("chat/a".into(), "2".into(), "ok".into()))
+        .await
+        .unwrap();
+    assert_eq!(s.count::<PgRevision>().await.unwrap(), 2);
+}
+
+// ── A2: projection reads ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn pg_project_returns_columns_without_blobs() {
+    let s = store().await;
+    let _g = serial().await;
+    clean!(s, PgRevision);
+    s.save(&PgRevision::new("chat/a".into(), "1".into(), "body-one".into()))
+        .await
+        .unwrap();
+
+    let rows = s
+        .find::<PgRevision>()
+        .eq("session_id", &"chat/a")
+        .project(&["generation"])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("generation"), Some("1"));
+    assert!(rows[0].get("body").is_none());
+}
+
+// ── A3: atomic guarded insert ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn pg_insert_guarded_lands_monotonic_writes() {
+    use airnest::GuardOutcome;
+    let s = store().await;
+    let _g = serial().await;
+    clean!(s, PgRevision);
+
+    let guard = airnest::SequenceGuard {
+        partition: vec![("session_id".to_string(), "chat/a".to_string())],
+        sequence_column: "generation".to_string(),
+        sequence_value: 1,
+    };
+    assert_eq!(
+        s.insert_guarded(
+            &PgRevision::new("chat/a".into(), "1".into(), "one".into()),
+            &guard
+        )
+        .await
+        .unwrap(),
+        GuardOutcome::Landed
+    );
+    let stale = airnest::SequenceGuard {
+        sequence_value: 1,
+        ..guard.clone()
+    };
+    // Re-inserting the same generation must not land twice.
+    assert_eq!(
+        s.insert_guarded(
+            &PgRevision::new("chat/a".into(), "1".into(), "dupe".into()),
+            &stale
+        )
+        .await
+        .unwrap(),
+        GuardOutcome::Rejected
+    );
+    assert_eq!(s.count::<PgRevision>().await.unwrap(), 1);
+}

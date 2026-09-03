@@ -26,4 +26,11 @@ pub enum StoreError {
 
     #[error("bad id: {0}")]
     BadId(String),
+
+    /// A uniqueness constraint rejected the write. Returned instead of a
+    /// backend error when an `INSERT` collides with a declared
+    /// `unique(...)` group, so callers can distinguish "already exists"
+    /// from "storage failed" without parsing database messages.
+    #[error("unique constraint violated: {0}")]
+    Conflict(String),
 }

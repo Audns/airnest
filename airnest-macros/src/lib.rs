@@ -54,10 +54,27 @@ use syn::{
 /// ```
 /// The `content` field is automatically JSON-serialized and stored in a
 /// `content_json` TEXT column.
+///
+/// # Unique constraints
+///
+/// ```ignore
+/// #[persistent(index(session_id), unique(session_id, generation))]
+/// pub struct Revision {
+///     pub session_id: String,
+///     pub generation: String,
+/// }
+/// ```
+///
+/// Each `unique(...)` group becomes a `UNIQUE` index, so the database
+/// rejects duplicates instead of application code rediscovering them.
+/// Unique fields are stored as index columns automatically.
 #[proc_macro_attribute]
 pub fn persistent(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = if args.is_empty() {
-        PersistentArgs { indexes: vec![] }
+        PersistentArgs {
+            indexes: vec![],
+            uniques: vec![],
+        }
     } else {
         parse_macro_input!(args as PersistentArgs)
     };
@@ -107,6 +124,7 @@ fn validate_struct<'a>(
     ident: &syn::Ident,
     data: &'a syn::Data,
     indexes: &[String],
+    uniques: &[Vec<String>],
 ) -> syn::Result<&'a syn::FieldsNamed> {
     let named = match data {
         syn::Data::Struct(s) => match &s.fields {
@@ -151,6 +169,28 @@ fn validate_struct<'a>(
         }
     }
 
+    for group in uniques {
+        if group.is_empty() {
+            return Err(syn::Error::new_spanned(
+                ident,
+                "`unique(...)` needs at least one field",
+            ));
+        }
+        for field in group {
+            let field_ident = syn::Ident::new(field, Span::call_site());
+            if !named
+                .named
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == &field_ident))
+            {
+                return Err(syn::Error::new_spanned(
+                    ident,
+                    format!("unique field `{field}` not found in `{ident}`"),
+                ));
+            }
+        }
+    }
+
     Ok(named)
 }
 
@@ -162,7 +202,11 @@ struct ProcessedFields {
     all_value_exprs: Vec<proc_macro2::TokenStream>,
 }
 
-fn process_fields(indexes: &[String], named: &syn::FieldsNamed) -> ProcessedFields {
+fn process_fields(
+    indexes: &[String],
+    uniques: &[Vec<String>],
+    named: &syn::FieldsNamed,
+) -> ProcessedFields {
     let mut regular_fields = Vec::new();
     let mut json_field_idents = Vec::new();
     let mut index_field_idents = Vec::new();
@@ -189,7 +233,12 @@ fn process_fields(indexes: &[String], named: &syn::FieldsNamed) -> ProcessedFiel
             json_field_idents.push(field_ident.clone());
         }
 
-        let is_index = indexes.iter().any(|i| i == &field_ident.to_string());
+        let is_index = indexes.iter().any(|i| i == &field_ident.to_string())
+            // Unique fields are stored as index columns automatically, so
+            // the constraint has real columns to enforce on.
+            || uniques
+                .iter()
+                .any(|g| g.iter().any(|u| u == &field_ident.to_string()));
 
         if !is_json && is_index {
             index_field_idents.push(field_ident.clone());
@@ -316,8 +365,8 @@ fn expand_persistent(
     let vis = &input.vis;
     let table_name = ident.to_string();
 
-    let named = validate_struct(ident, &input.data, &args.indexes)?;
-    let pf = process_fields(&args.indexes, named);
+    let named = validate_struct(ident, &input.data, &args.indexes, &args.uniques)?;
+    let pf = process_fields(&args.indexes, &args.uniques, named);
 
     // Pull the pieces we splice into the final quote! out of `pf` so we can
     // use them in repetition patterns (`#(#var)*`).
@@ -377,6 +426,7 @@ fn expand_persistent(
         count_by_methods: &count_by_methods,
         all_column_names: &all_column_names,
         all_value_exprs: &all_value_exprs,
+        uniques: &args.uniques,
     }))
 }
 
@@ -401,6 +451,7 @@ struct RenderArgs<'a> {
     count_by_methods: &'a [proc_macro2::TokenStream],
     all_column_names: &'a [String],
     all_value_exprs: &'a [proc_macro2::TokenStream],
+    uniques: &'a [Vec<String>],
 }
 
 fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
@@ -425,7 +476,14 @@ fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
         all_column_names,
         all_value_exprs,
         extra_derive,
+        uniques,
     } = r;
+    let unique_groups: Vec<proc_macro2::TokenStream> = uniques
+        .iter()
+        .map(|group| {
+            quote! { &[#(#group),*] }
+        })
+        .collect();
     quote! {
         #(#attrs)*
         #extra_derive
@@ -537,6 +595,10 @@ fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
             fn index_values(&self) -> ::std::vec::Vec<::std::string::String> {
                 ::std::vec![#(#all_value_exprs),*]
             }
+
+            fn unique_constraints() -> &'static [&'static [&'static str]] {
+                &[#(#unique_groups),*]
+            }
         }
     }
 }
@@ -546,12 +608,14 @@ fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
 /// Parsed form of `#[persistent(index(a, b, c))]` with legacy `key = ...` support.
 struct PersistentArgs {
     indexes: Vec<String>,
+    uniques: Vec<Vec<String>>,
 }
 
 impl Parse for PersistentArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         // Support legacy `key = <ident>` (ignored — new `id` is the PK) and `index(...)`.
         let mut indexes = Vec::new();
+        let mut uniques = Vec::new();
         while !input.is_empty() {
             if input.peek(syn::Ident) {
                 let lookahead = input.fork();
@@ -567,10 +631,27 @@ impl Parse for PersistentArgs {
                 }
             }
             let kw: syn::Ident = input.parse()?;
+            if kw == "unique" {
+                let content;
+                syn::parenthesized!(content in input);
+                let mut group = Vec::new();
+                while !content.is_empty() {
+                    let ident: syn::Ident = content.parse()?;
+                    group.push(ident.to_string());
+                    if content.peek(Token![,]) {
+                        content.parse::<Token![,]>()?;
+                    }
+                }
+                uniques.push(group);
+                if input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                }
+                continue;
+            }
             if kw != "index" {
                 return Err(syn::Error::new_spanned(
                     kw,
-                    "expected `index(field, ...)`. Bare `#[persistent]` needs no arguments.",
+                    "expected `index(field, ...)` or `unique(field, ...)`. Bare `#[persistent]` needs no arguments.",
                 ));
             }
             let content;
@@ -586,6 +667,6 @@ impl Parse for PersistentArgs {
                 input.parse::<Token![,]>()?;
             }
         }
-        Ok(Self { indexes })
+        Ok(Self { indexes, uniques })
     }
 }

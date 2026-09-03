@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::{
-    backend::{Backend, BackendBatch, Filter, Order, QueryRequest},
+    backend::{Backend, BackendBatch, Filter, Order, ProjectedRow, QueryRequest},
     codec::Codec,
     error::StoreError,
     index::ToIndexValue,
@@ -157,6 +157,35 @@ impl BackendImpl {
             Self::Redb(b) => b.query::<T>(request, codec).await,
             #[cfg(feature = "postgres")]
             Self::Postgres(b) => b.query::<T>(request, codec).await,
+        }
+    }
+
+    async fn query_projected(
+        &self,
+        request: QueryRequest,
+        columns: &[String],
+    ) -> Result<Vec<crate::backend::ProjectedRow>, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.query_projected(request, columns).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.query_projected(request, columns).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.query_projected(request, columns).await,
+        }
+    }
+
+    async fn insert_guarded<T: Persistent>(
+        &self,
+        value: &T,
+        guard: &crate::backend::SequenceGuard,
+        codec: Codec,
+    ) -> Result<crate::backend::GuardOutcome, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.insert_guarded(value, guard, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.insert_guarded(value, guard, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.insert_guarded(value, guard, codec).await,
         }
     }
 
@@ -358,11 +387,29 @@ impl Store {
         self.codec.encode(value)
     }
 
+    /// Translate a backend unique-violation into [`StoreError::Conflict`].
+    ///
+    /// Single translation point for the SQL backends: a `UNIQUE` index
+    /// declared via `unique(...)` rejects the write deep inside sqlx, and
+    /// callers need "already exists" rather than "storage failed". The
+    /// redb backend raises `Conflict` directly.
+    fn collapse_conflict<T>(result: Result<T, StoreError>, what: &str) -> Result<T, StoreError> {
+        match result {
+            Err(StoreError::Sqlite(e)) if crate::backend::is_unique_violation(&e) => {
+                Err(StoreError::Conflict(format!("{what}: unique constraint violated")))
+            }
+            r => r,
+        }
+    }
+
     /// Persist a value. **Upsert** semantics: inserts or overwrites by the
     /// struct's embedded [`AirId`](crate::AirId).
+    ///
+    /// May return [`StoreError::Conflict`] when the value collides with a
+    /// declared `unique(...)` group owned by another row.
     pub async fn save<T: Persistent>(&self, value: &T) -> Result<(), StoreError> {
         self.ensure_table::<T>().await?;
-        self.inner.save(value, self.codec).await
+        Self::collapse_conflict(self.inner.save(value, self.codec).await, T::TABLE)
     }
 
     /// Load a value by id. Accepts an [`AirId`](crate::AirId) or a reference to the value itself.
@@ -415,6 +462,15 @@ impl Store {
         self.inner.delete::<T>(&id_bytes).await
     }
 
+    /// Delete by a hex id previously returned from an `id` projection.
+    /// Same no-op-if-missing semantics as [`delete`](Self::delete).
+    pub async fn delete_id<T: Persistent>(&self, hex: &str) -> Result<(), StoreError> {
+        use crate::AirId;
+        self.ensure_table::<T>().await?;
+        let id = AirId::<T>::from_hex(hex)?;
+        self.inner.delete::<T>(&id.to_bytes()).await
+    }
+
     /// Delete **all** rows of type `T`. Returns the number of rows deleted.
     pub async fn delete_all<T: Persistent>(&self) -> Result<u64, StoreError> {
         self.ensure_table::<T>().await?;
@@ -460,7 +516,57 @@ impl Store {
 
     /// Atomically save multiple values (possibly of different types) in one transaction.
     pub async fn save_batch(&self, batch: StoreBatch) -> Result<(), StoreError> {
-        self.inner.save_batch(&batch.inner, self.codec).await
+        Self::collapse_conflict(
+            self.inner.save_batch(&batch.inner, self.codec).await,
+            "batch",
+        )
+    }
+
+    /// Atomically insert `value` for a monotonic sequence.
+    ///
+    /// Inserts if and only if no row matching `guard.partition` carries
+    /// `guard.sequence_column >= guard.sequence_value` (numeric
+    /// comparison). The check and the insert are one atomic unit, so
+    /// concurrent writers cannot interleave a stale write: at most one
+    /// racer lands, the loser gets [`GuardOutcome::Rejected`] — including
+    /// a lost race on a matching `UNIQUE` index, which is mapped to
+    /// `Rejected` rather than surfaced as an error.
+    ///
+    /// Partition and sequence columns must be index columns of `T`;
+    /// anything else is an error. This is the primitive versioned records
+    /// (session generations, log offsets) build on instead of
+    /// read-modify-write.
+    pub async fn insert_guarded<T: Persistent>(
+        &self,
+        value: &T,
+        guard: &crate::backend::SequenceGuard,
+    ) -> Result<crate::backend::GuardOutcome, StoreError> {
+        for (col, _) in &guard.partition {
+            if !T::index_columns().contains(&col.as_str()) {
+                return Err(StoreError::Codec(format!(
+                    "unknown partition column `{col}` for `{}`",
+                    T::TABLE
+                )));
+            }
+        }
+        if !T::index_columns().contains(&guard.sequence_column.as_str()) {
+            return Err(StoreError::Codec(format!(
+                "unknown sequence column `{}` for `{}`",
+                guard.sequence_column,
+                T::TABLE
+            )));
+        }
+        self.ensure_table::<T>().await?;
+        // A lost UNIQUE race is Rejected by contract, on every backend.
+        match self.inner.insert_guarded(value, guard, self.codec).await {
+            Err(StoreError::Conflict(_)) => Ok(crate::backend::GuardOutcome::Rejected),
+            Err(StoreError::Sqlite(e))
+                if crate::backend::is_unique_violation(&e) =>
+            {
+                Ok(crate::backend::GuardOutcome::Rejected)
+            }
+            r => r,
+        }
     }
 
     /// Start a typed query for `T`.
@@ -511,9 +617,12 @@ impl Store {
             let index_vals = item.index_values();
             prepared.push((id, v, index_vals));
         }
-        self.inner
-            .replace_where::<T>(filters, &prepared, self.codec)
-            .await
+        Self::collapse_conflict(
+            self.inner
+                .replace_where::<T>(filters, &prepared, self.codec)
+                .await,
+            T::TABLE,
+        )
     }
 
     // ── init registration ─────────────────────────────────────────────────────
@@ -628,6 +737,45 @@ impl<'a, T: Persistent> Query<'a, T> {
         }
         let request = self.to_request();
         self.store.inner.query_count(request).await
+    }
+
+    /// Metadata-only read: return the requested index columns for matching
+    /// rows without fetching or decoding blobs. Filters, ordering, and
+    /// limit behave exactly like [`all`](Self::all).
+    ///
+    /// Every name in `columns` must be one of `T`'s index columns; anything
+    /// else (including the blob itself) is an error. This is the primitive
+    /// that keeps guards, listings, and cleanups O(metadata) instead of
+    /// O(payload).
+    pub async fn project(self, columns: &[&str]) -> Result<Vec<ProjectedRow>, StoreError> {
+        if columns.is_empty() {
+            return Err(StoreError::Codec(
+                "project needs at least one column".into(),
+            ));
+        }
+        for col in columns {
+            // `id` is a pseudo-column: the row id as 32-char hex, for
+            // callers that need to address rows found by metadata (GC
+            // deletes) without materializing blobs.
+            if *col != "id" && !T::index_columns().contains(col) {
+                return Err(StoreError::Codec(format!(
+                    "unknown column `{col}` for `{}` (index columns: {})",
+                    T::TABLE,
+                    T::index_columns().join(", "),
+                )));
+            }
+        }
+        self.store.ensure_table::<T>().await?;
+        for f in &self.filters {
+            if let Filter::In(_, vals) = f
+                && vals.is_empty()
+            {
+                return Ok(vec![]);
+            }
+        }
+        let request = self.to_request();
+        let owned: Vec<String> = columns.iter().map(ToString::to_string).collect();
+        self.store.inner.query_projected(request, &owned).await
     }
 }
 
@@ -772,6 +920,7 @@ impl StoreBatch {
             value_bytes: v,
             index_columns: T::index_columns(),
             index_values: value.index_values(),
+            unique_groups: T::unique_constraints(),
         });
         Ok(())
     }

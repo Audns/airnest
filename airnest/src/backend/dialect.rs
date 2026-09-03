@@ -100,11 +100,36 @@ pub trait SqlDialect: Send + Sync + 'static {
     /// Index naming convention is the dialect's choice.
     fn render_create_index(&self, table: &str, column: &str) -> String;
 
+    /// Renders a `CREATE UNIQUE INDEX IF NOT EXISTS` statement for one
+    /// uniqueness group. Additive: runs after table creation, so it also
+    /// applies to tables created before the constraint was declared.
+    /// Index naming convention is the dialect's choice, but must be
+    /// deterministic in (table, columns).
+    fn render_create_unique_index(&self, table: &str, columns: &[&str]) -> String;
+
     // ── DML ──────────────────────────────────────────────────────
 
     /// Renders an `INSERT ... ON CONFLICT DO UPDATE` statement for a single row.
     /// The dialect assumes bind order is `id, v, [index_values...]`.
     fn render_upsert(&self, schema: &TableSchema) -> String;
+
+    /// Renders an atomic guarded insert for a monotonic sequence.
+    ///
+    /// Shape: `INSERT ... SELECT id, v, now, index_values...
+    /// WHERE NOT EXISTS (a row in `partition` at or beyond the sequence
+    /// value)`. The check and the insert are one statement, so concurrent
+    /// writers cannot interleave between them; pair with a `UNIQUE` index
+    /// on `(partition..., sequence)` so even a lost race resolves to zero
+    /// affected rows (or a mappable conflict) rather than duplicates.
+    ///
+    /// Bind order is fixed: `id, v, [index_values...],
+    /// [partition values...], sequence_value`.
+    fn render_insert_guarded(
+        &self,
+        schema: &TableSchema,
+        partition: &[&str],
+        sequence_column: &str,
+    ) -> String;
 
     /// Renders a dynamic SELECT statement for a query request.
     /// `select_clause` is the leading projection (e.g. `"SELECT v"` or

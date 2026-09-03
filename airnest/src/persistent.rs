@@ -49,4 +49,14 @@ pub trait Persistent: Serialize + DeserializeOwned + Send + Sync + 'static {
 
     /// Current values for each index column, in the same order as `index_columns()`.
     fn index_values(&self) -> Vec<String>;
+
+    /// Uniqueness groups over index columns, one entry per `unique(...)`
+    /// group in `#[persistent]`. Each group becomes a `UNIQUE` index, so
+    /// the database — not application code — rejects duplicates.
+    ///
+    /// Defaults to no constraints, keeping manual implementations (discouraged)
+    /// compiling.
+    fn unique_constraints() -> &'static [&'static [&'static str]] {
+        &[]
+    }
 }

@@ -2,6 +2,8 @@
 
 use std::marker::PhantomData;
 
+use crate::StoreError;
+
 /// A type-tagged `UUIDv7` id. The tag `T` is zero-sized; the id carries no runtime
 /// overhead beyond a [`uuid::Uuid`].
 ///
@@ -57,6 +59,22 @@ impl<T> AirId<T> {
             uuid: uuid::Uuid::from_bytes(bytes),
             _tag: PhantomData,
         }
+    }
+
+    /// 32-char lowercase hex form, as returned by `id` projections.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        self.uuid.as_simple().to_string()
+    }
+
+    /// Parse the hex form back (accepts hyphenated UUIDs too).
+    pub fn from_hex(s: &str) -> Result<Self, StoreError> {
+        let uuid =
+            uuid::Uuid::parse_str(s).map_err(|e| StoreError::BadId(format!("bad id `{s}`: {e}")))?;
+        Ok(Self {
+            uuid,
+            _tag: PhantomData,
+        })
     }
 }
 

@@ -34,3 +34,18 @@ postgres = ["sqlx/postgres"]
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[[test]]
+name = "store_tests"
+path = "../tests/store_tests.rs"
+
+[[test]]
+name = "redb_tests"
+path = "../tests/redb_tests.rs"
+required-features = ["redb"]
+
+[[test]]
+name = "postgres_tests"
+path = "../tests/postgres_tests.rs"
+required-features = ["postgres"]
