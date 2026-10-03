@@ -113,6 +113,38 @@ pub trait SqlDialect: Send + Sync + 'static {
     /// The dialect assumes bind order is `id, v, [index_values...]`.
     fn render_upsert(&self, schema: &TableSchema) -> String;
 
+    /// Renders a plain `INSERT` for a single row: no conflict clause, so an
+    /// existing id or unique group fails the statement. Bind order is
+    /// `id, v, [index_values...]`, the same as [`render_upsert`](Self::render_upsert).
+    fn render_insert(&self, schema: &TableSchema) -> String {
+        let quoted_table = self.quote_ident(schema.table);
+        let now = self.current_epoch_seconds_expr();
+        let mut cols = String::new();
+        let mut placeholders = String::new();
+        for (i, col) in schema.index_columns.iter().enumerate() {
+            cols.push_str(", ");
+            cols.push_str(&self.quote_ident(col));
+            placeholders.push_str(", ");
+            placeholders.push_str(&self.placeholder(i + 3));
+        }
+        format!(
+            "INSERT INTO {quoted_table} (id, v, saved_at{cols}) VALUES ({}, {}, {now}{placeholders})",
+            self.placeholder(1),
+            self.placeholder(2),
+        )
+    }
+
+    /// Renders `DELETE FROM <table> [WHERE ...]` with its binds.
+    fn render_delete_where(&self, table: &str, filters: &[Filter]) -> RenderedSelect {
+        let (where_clause, binds) = self.render_where_clause(filters);
+        let mut sql = format!("DELETE FROM {}", self.quote_ident(table));
+        if !where_clause.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_clause);
+        }
+        RenderedSelect { sql, binds }
+    }
+
     /// Renders an atomic guarded insert for a monotonic sequence.
     ///
     /// Shape: `INSERT ... SELECT id, v, now, index_values...
@@ -135,6 +167,33 @@ pub trait SqlDialect: Send + Sync + 'static {
     /// `select_clause` is the leading projection (e.g. `"SELECT v"` or
     /// `"SELECT COUNT(*)"`).
     fn render_select(&self, request: &QueryRequest, select_clause: &str) -> RenderedSelect;
+
+    /// SQL expression sorting `column` numerically (a TEXT cell that is
+    /// not an integer sorts as 0). `SQLite`: `CAST(col AS INTEGER)`.
+    fn numeric_sort_expr(&self, quoted_column: &str) -> String;
+
+    /// Renders the ` ORDER BY a ASC, b DESC` suffix (leading space), or an
+    /// empty string for no ordering. One clause for every key: repeating
+    /// `ORDER BY` per key is a syntax error.
+    fn render_order_by(&self, order_by: &[(String, crate::backend::Order)]) -> String {
+        if order_by.is_empty() {
+            return String::new();
+        }
+        let keys: Vec<String> = order_by
+            .iter()
+            .map(|(col, order)| {
+                let quoted = self.quote_ident(col);
+                let expr = if order.is_numeric() {
+                    self.numeric_sort_expr(&quoted)
+                } else {
+                    quoted
+                };
+                let dir = if order.is_descending() { "DESC" } else { "ASC" };
+                format!("{expr} {dir}")
+            })
+            .collect();
+        format!(" ORDER BY {}", keys.join(", "))
+    }
 
     /// Renders a `WHERE` clause (without the leading keyword) for the given
     /// filters. Returns the rendered fragment and the bind values in order.

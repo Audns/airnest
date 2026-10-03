@@ -69,8 +69,8 @@ impl<T> AirId<T> {
 
     /// Parse the hex form back (accepts hyphenated UUIDs too).
     pub fn from_hex(s: &str) -> Result<Self, StoreError> {
-        let uuid =
-            uuid::Uuid::parse_str(s).map_err(|e| StoreError::BadId(format!("bad id `{s}`: {e}")))?;
+        let uuid = uuid::Uuid::parse_str(s)
+            .map_err(|e| StoreError::BadId(format!("bad id `{s}`: {e}")))?;
         Ok(Self {
             uuid,
             _tag: PhantomData,

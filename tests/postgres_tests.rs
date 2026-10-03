@@ -456,11 +456,19 @@ async fn pg_unique_constraint_rejects_duplicates_as_conflict() {
     let s = store().await;
     let _g = serial().await;
     clean!(s, PgRevision);
-    s.save(&PgRevision::new("chat/a".into(), "1".into(), "first".into()))
-        .await
-        .unwrap();
+    s.save(&PgRevision::new(
+        "chat/a".into(),
+        "1".into(),
+        "first".into(),
+    ))
+    .await
+    .unwrap();
     let err = s
-        .save(&PgRevision::new("chat/a".into(), "1".into(), "second".into()))
+        .save(&PgRevision::new(
+            "chat/a".into(),
+            "1".into(),
+            "second".into(),
+        ))
         .await
         .unwrap_err();
     assert!(
@@ -480,9 +488,13 @@ async fn pg_project_returns_columns_without_blobs() {
     let s = store().await;
     let _g = serial().await;
     clean!(s, PgRevision);
-    s.save(&PgRevision::new("chat/a".into(), "1".into(), "body-one".into()))
-        .await
-        .unwrap();
+    s.save(&PgRevision::new(
+        "chat/a".into(),
+        "1".into(),
+        "body-one".into(),
+    ))
+    .await
+    .unwrap();
 
     let rows = s
         .find::<PgRevision>()

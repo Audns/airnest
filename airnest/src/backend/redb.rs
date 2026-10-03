@@ -7,7 +7,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, Table, TableDefinition};
 
 use crate::{
     backend::{
-        Backend, BackendBatch, BatchEntry, Filter, GuardOutcome, Order, QueryRequest, SequenceGuard,
+        Backend, BackendBatch, BatchEntry, Filter, GuardOutcome, QueryRequest, SequenceGuard,
     },
     codec::Codec,
     error::StoreError,
@@ -117,6 +117,17 @@ struct Record {
     bytes: Vec<u8>,
     saved_at: u64,
     index_values: HashMap<String, String>,
+}
+
+/// Whether `rec` satisfies every filter (the in-memory WHERE).
+fn record_matches(rec: &Record, filters: &[Filter]) -> bool {
+    filters.iter().all(|filter| match filter {
+        Filter::Eq(col, val) => rec.index_values.get(col) == Some(val),
+        Filter::In(col, vals) => rec
+            .index_values
+            .get(col)
+            .is_some_and(|v| vals.contains(v)),
+    })
 }
 
 #[derive(Clone)]
@@ -256,7 +267,14 @@ impl Backend for RedbBackend {
                             .map(|r| r.index_values)
                             .unwrap_or_default()
                     });
-                sync_unique_keys(&mut uq, table, groups, old.as_ref(), &index_values, &id_bytes)?;
+                sync_unique_keys(
+                    &mut uq,
+                    table,
+                    groups,
+                    old.as_ref(),
+                    &index_values,
+                    &id_bytes,
+                )?;
                 tbl.insert(key.as_slice(), record_bytes.as_slice())
                     .map_err(|e| StoreError::Redb(e.to_string()))?;
             }
@@ -293,7 +311,7 @@ impl Backend for RedbBackend {
         match record_bytes {
             Some(b) => {
                 let rec: Record = bitcode::deserialize(&b).map_err(StoreError::Encode)?;
-                Ok(Some(codec.decode(&rec.bytes)?))
+                Ok(Some(crate::codec::decode_row::<T>(codec, &rec.bytes)?))
             }
             None => Ok(None),
         }
@@ -332,7 +350,7 @@ impl Backend for RedbBackend {
             .into_iter()
             .map(|b| {
                 let rec: Record = bitcode::deserialize(&b).map_err(StoreError::Encode)?;
-                codec.decode(&rec.bytes)
+                crate::codec::decode_row::<T>(codec, &rec.bytes)
             })
             .collect::<Result<Vec<T>, _>>()
     }
@@ -448,7 +466,7 @@ impl Backend for RedbBackend {
         let records = self.scan_records(table).await?;
         records
             .into_iter()
-            .map(|rec| codec.decode(&rec.bytes))
+            .map(|rec| crate::codec::decode_row::<T>(codec, &rec.bytes))
             .collect::<Result<Vec<T>, _>>()
     }
 
@@ -512,14 +530,7 @@ impl Backend for RedbBackend {
         }
 
         for (col, order) in request.order_by.iter().rev() {
-            recs.sort_by(|a, b| {
-                let av = a.index_values.get(col);
-                let bv = b.index_values.get(col);
-                match order {
-                    Order::Asc => av.cmp(&bv),
-                    Order::Desc => bv.cmp(&av),
-                }
-            });
+            recs.sort_by(|a, b| order.compare(a.index_values.get(col), b.index_values.get(col)));
         }
 
         if let Some(n) = request.limit {
@@ -527,8 +538,113 @@ impl Backend for RedbBackend {
         }
 
         recs.into_iter()
-            .map(|rec| codec.decode(&rec.bytes))
+            .map(|rec| crate::codec::decode_row::<T>(codec, &rec.bytes))
             .collect::<Result<Vec<T>, _>>()
+    }
+
+    async fn query_blobs(&self, request: QueryRequest) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut recs = self.scan_records(request.table).await?;
+        recs.retain(|rec| record_matches(rec, &request.filters));
+        for (col, order) in request.order_by.iter().rev() {
+            recs.sort_by(|a, b| order.compare(a.index_values.get(col), b.index_values.get(col)));
+        }
+        if let Some(n) = request.limit {
+            recs.truncate(n);
+        }
+        Ok(recs.into_iter().map(|rec| rec.bytes).collect())
+    }
+
+    async fn delete_where<T: Persistent>(&self, filters: &[Filter]) -> Result<u64, StoreError> {
+        let table = T::TABLE;
+        let (start, end) = Self::table_range(table);
+        let groups = T::unique_constraints();
+        let filters = filters.to_vec();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let txn = db
+                .begin_write()
+                .map_err(|e| StoreError::Redb(e.to_string()))?;
+            let mut removed = 0u64;
+            {
+                let mut tbl = txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let mut uq = txn
+                    .open_table(UQ_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                let mut doomed = Vec::new();
+                for item in tbl
+                    .range(start.as_slice()..=end.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?
+                {
+                    let (k, v) = item.map_err(|e| StoreError::Redb(e.to_string()))?;
+                    let rec: Record =
+                        bitcode::deserialize(v.value()).map_err(StoreError::Encode)?;
+                    if record_matches(&rec, &filters) {
+                        doomed.push((k.value().to_vec(), rec.index_values));
+                    }
+                }
+                for (key, index_values) in doomed {
+                    remove_unique_keys(&mut uq, table, groups, &index_values)?;
+                    tbl.remove(key.as_slice())
+                        .map_err(|e| StoreError::Redb(e.to_string()))?;
+                    removed += 1;
+                }
+            }
+            txn.commit().map_err(|e| StoreError::Redb(e.to_string()))?;
+            Ok::<_, StoreError>(removed)
+        })
+        .await
+        .map_err(StoreError::Join)?
+    }
+
+    async fn insert<T: Persistent>(&self, value: &T, codec: Codec) -> Result<(), StoreError> {
+        let table = T::TABLE;
+        let id_bytes = value.id().to_bytes();
+        let key = Self::make_key(table, &id_bytes);
+        let index_values: HashMap<String, String> = T::index_columns()
+            .iter()
+            .zip(value.index_values().iter())
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        let record = Record {
+            id: id_bytes,
+            bytes: codec.encode(value)?,
+            saved_at: 0,
+            index_values: index_values.clone(),
+        };
+        let record_bytes = bitcode::serialize(&record).map_err(StoreError::Encode)?;
+        let groups = T::unique_constraints();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let txn = db
+                .begin_write()
+                .map_err(|e| StoreError::Redb(e.to_string()))?;
+            {
+                let mut tbl = txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                if tbl
+                    .get(key.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?
+                    .is_some()
+                {
+                    return Err(StoreError::Conflict(format!(
+                        "insert into `{table}`: row exists"
+                    )));
+                }
+                let mut uq = txn
+                    .open_table(UQ_TABLE)
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+                sync_unique_keys(&mut uq, table, groups, None, &index_values, &id_bytes)?;
+                tbl.insert(key.as_slice(), record_bytes.as_slice())
+                    .map_err(|e| StoreError::Redb(e.to_string()))?;
+            }
+            txn.commit().map_err(|e| StoreError::Redb(e.to_string()))?;
+            Ok::<_, StoreError>(())
+        })
+        .await
+        .map_err(StoreError::Join)?
     }
 
     async fn query_count(&self, request: QueryRequest) -> Result<i64, StoreError> {
@@ -583,14 +699,7 @@ impl Backend for RedbBackend {
         }
 
         for (col, order) in request.order_by.iter().rev() {
-            recs.sort_by(|a, b| {
-                let av = a.index_values.get(col);
-                let bv = b.index_values.get(col);
-                match order {
-                    Order::Asc => av.cmp(&bv),
-                    Order::Desc => bv.cmp(&av),
-                }
-            });
+            recs.sort_by(|a, b| order.compare(a.index_values.get(col), b.index_values.get(col)));
         }
 
         if let Some(n) = request.limit {
@@ -605,11 +714,7 @@ impl Backend for RedbBackend {
                     .iter()
                     .map(|c| {
                         if c == "id" {
-                            Some(
-                                uuid::Uuid::from_bytes(rec.id)
-                                    .as_simple()
-                                    .to_string(),
-                            )
+                            Some(uuid::Uuid::from_bytes(rec.id).as_simple().to_string())
                         } else {
                             rec.index_values.get(c).cloned()
                         }
@@ -841,7 +946,14 @@ impl Backend for RedbBackend {
                     });
                 // A lost race on a UNIQUE group surfaces as Conflict, which
                 // the Store layer reports as Rejected.
-                sync_unique_keys(&mut uq, table, groups, old.as_ref(), &record.index_values, &id_bytes)?;
+                sync_unique_keys(
+                    &mut uq,
+                    table,
+                    groups,
+                    old.as_ref(),
+                    &record.index_values,
+                    &id_bytes,
+                )?;
                 tbl.insert(key.as_slice(), record_bytes.as_slice())
                     .map_err(|e| StoreError::Redb(e.to_string()))?;
             }

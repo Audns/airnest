@@ -68,12 +68,30 @@ use syn::{
 /// Each `unique(...)` group becomes a `UNIQUE` index, so the database
 /// rejects duplicates instead of application code rediscovering them.
 /// Unique fields are stored as index columns automatically.
+///
+/// Rows an older shape wrote (positional codecs cannot read a blob from
+/// before a field was appended) decode through an upgrade function:
+///
+/// ```ignore
+/// #[persistent(index(book), upgrade = Note::from_legacy)]
+/// pub struct Note { pub book: String, pub text: String, pub pinned: Option<bool> }
+///
+/// impl Note {
+///     fn from_legacy(raw: &airnest::Legacy<'_>) -> Option<Self> {
+///         let old: NoteV1 = raw.decode()?; // the historical shape, `id` first
+///         Some(Note { id: airnest::AirId::from_bytes(old.id.to_bytes()), book: old.book, text: old.text, pinned: None })
+///     }
+/// }
+/// ```
+///
+/// Every read path (load, query, scan, transactions) falls back to it.
 #[proc_macro_attribute]
 pub fn persistent(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = if args.is_empty() {
         PersistentArgs {
             indexes: vec![],
             uniques: vec![],
+            upgrade: None,
         }
     } else {
         parse_macro_input!(args as PersistentArgs)
@@ -427,6 +445,7 @@ fn expand_persistent(
         all_column_names: &all_column_names,
         all_value_exprs: &all_value_exprs,
         uniques: &args.uniques,
+        upgrade: args.upgrade.as_ref(),
     }))
 }
 
@@ -452,6 +471,7 @@ struct RenderArgs<'a> {
     all_column_names: &'a [String],
     all_value_exprs: &'a [proc_macro2::TokenStream],
     uniques: &'a [Vec<String>],
+    upgrade: Option<&'a syn::Path>,
 }
 
 fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
@@ -477,7 +497,15 @@ fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
         all_value_exprs,
         extra_derive,
         uniques,
+        upgrade,
     } = r;
+    let upgrade_fn = upgrade.map(|path| {
+        quote! {
+            fn upgrade(raw: &::airnest::Legacy<'_>) -> ::std::option::Option<Self> {
+                #path(raw)
+            }
+        }
+    });
     let unique_groups: Vec<proc_macro2::TokenStream> = uniques
         .iter()
         .map(|group| {
@@ -599,6 +627,8 @@ fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
             fn unique_constraints() -> &'static [&'static [&'static str]] {
                 &[#(#unique_groups),*]
             }
+
+            #upgrade_fn
         }
     }
 }
@@ -609,6 +639,9 @@ fn render_output(r: &RenderArgs<'_>) -> proc_macro2::TokenStream {
 struct PersistentArgs {
     indexes: Vec<String>,
     uniques: Vec<Vec<String>>,
+    /// `upgrade = path`: a `fn(&Legacy<'_>) -> Option<Self>` for blobs
+    /// an older shape wrote.
+    upgrade: Option<syn::Path>,
 }
 
 impl Parse for PersistentArgs {
@@ -616,6 +649,7 @@ impl Parse for PersistentArgs {
         // Support legacy `key = <ident>` (ignored — new `id` is the PK) and `index(...)`.
         let mut indexes = Vec::new();
         let mut uniques = Vec::new();
+        let mut upgrade = None;
         while !input.is_empty() {
             if input.peek(syn::Ident) {
                 let lookahead = input.fork();
@@ -631,6 +665,17 @@ impl Parse for PersistentArgs {
                 }
             }
             let kw: syn::Ident = input.parse()?;
+            if kw == "upgrade" {
+                input.parse::<Token![=]>()?;
+                if upgrade.is_some() {
+                    return Err(syn::Error::new_spanned(kw, "`upgrade = ...` given twice"));
+                }
+                upgrade = Some(input.parse::<syn::Path>()?);
+                if input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                }
+                continue;
+            }
             if kw == "unique" {
                 let content;
                 syn::parenthesized!(content in input);
@@ -651,7 +696,7 @@ impl Parse for PersistentArgs {
             if kw != "index" {
                 return Err(syn::Error::new_spanned(
                     kw,
-                    "expected `index(field, ...)` or `unique(field, ...)`. Bare `#[persistent]` needs no arguments.",
+                    "expected `index(field, ...)`, `unique(field, ...)`, or `upgrade = path`. Bare `#[persistent]` needs no arguments.",
                 ));
             }
             let content;
@@ -667,6 +712,10 @@ impl Parse for PersistentArgs {
                 input.parse::<Token![,]>()?;
             }
         }
-        Ok(Self { indexes, uniques })
+        Ok(Self {
+            indexes,
+            uniques,
+            upgrade,
+        })
     }
 }

@@ -207,7 +207,7 @@ impl Backend for PostgresBackend {
         match row {
             Some(r) => {
                 let bytes: Vec<u8> = r.get(0);
-                Ok(Some(codec.decode(&bytes)?))
+                Ok(Some(crate::codec::decode_row::<T>(codec, &bytes)?))
             }
             None => Ok(None),
         }
@@ -235,7 +235,7 @@ impl Backend for PostgresBackend {
             let rows = query.fetch_all(&self.pool).await?;
             for r in rows {
                 let bytes: Vec<u8> = r.get(0);
-                out.push(codec.decode(&bytes)?);
+                out.push(crate::codec::decode_row::<T>(codec, &bytes)?);
             }
         }
         Ok(out)
@@ -296,7 +296,7 @@ impl Backend for PostgresBackend {
         rows.into_iter()
             .map(|r| {
                 let bytes: Vec<u8> = r.get(0);
-                codec.decode(&bytes)
+                crate::codec::decode_row::<T>(codec, &bytes)
             })
             .collect::<Result<Vec<T>, _>>()
     }
@@ -327,9 +327,52 @@ impl Backend for PostgresBackend {
         rows.into_iter()
             .map(|r| {
                 let bytes: Vec<u8> = r.get(0);
-                codec.decode(&bytes)
+                crate::codec::decode_row::<T>(codec, &bytes)
             })
             .collect::<Result<Vec<T>, _>>()
+    }
+
+    async fn query_blobs(&self, request: QueryRequest) -> Result<Vec<Vec<u8>>, StoreError> {
+        let rendered = self.dialect.render_select(&request, "SELECT v");
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(rendered.sql.as_str()));
+        for p in rendered.binds {
+            query = query.bind(p);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|r| r.get::<Vec<u8>, _>(0)).collect())
+    }
+
+    async fn delete_where<T: Persistent>(&self, filters: &[Filter]) -> Result<u64, StoreError> {
+        self.ensure_table::<T>().await?;
+        let rendered = self.dialect.render_delete_where(T::TABLE, filters);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(rendered.sql.as_str()));
+        for p in rendered.binds {
+            query = query.bind(p);
+        }
+        Ok(query.execute(&self.pool).await?.rows_affected())
+    }
+
+    async fn insert<T: Persistent>(&self, value: &T, codec: Codec) -> Result<(), StoreError> {
+        self.ensure_table::<T>().await?;
+        let schema = TableSchema {
+            table: T::TABLE,
+            index_columns: T::index_columns(),
+        };
+        let sql = self.dialect.render_insert(&schema);
+        let id_bytes = value.id().to_bytes();
+        let v = codec.encode(value)?;
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        query = query.bind(&id_bytes[..]).bind(&v);
+        for val in value.index_values() {
+            query = query.bind(val);
+        }
+        match query.execute(&self.pool).await {
+            Ok(_) => Ok(()),
+            Err(e) if crate::backend::is_unique_violation(&e) => Err(StoreError::Conflict(
+                format!("insert into `{}`: row exists", T::TABLE),
+            )),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
     }
 
     async fn query_count(&self, request: QueryRequest) -> Result<i64, StoreError> {
@@ -373,9 +416,7 @@ impl Backend for PostgresBackend {
                     let mut id = [0u8; 16];
                     let len = raw.len().min(16);
                     id[..len].copy_from_slice(&raw[..len]);
-                    values.push(Some(
-                        uuid::Uuid::from_bytes(id).as_simple().to_string(),
-                    ));
+                    values.push(Some(uuid::Uuid::from_bytes(id).as_simple().to_string()));
                 } else {
                     let v: Option<String> = r.try_get(i).map_err(StoreError::Sqlite)?;
                     values.push(v);
@@ -558,7 +599,7 @@ impl Backend for PostgresBackend {
         rows.into_iter()
             .map(|r| {
                 let bytes: Vec<u8> = r.get(0);
-                codec.decode(&bytes)
+                crate::codec::decode_row::<T>(codec, &bytes)
             })
             .collect()
     }

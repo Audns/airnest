@@ -44,3 +44,39 @@ impl Codec {
         }
     }
 }
+
+/// A stored blob the current shape could not decode, handed to
+/// [`Persistent::upgrade`](crate::Persistent::upgrade) so a type can read
+/// rows written by an older binary.
+///
+/// Positional codecs (bitcode, postcard) carry no schema: a blob written
+/// before a field was appended fails to decode under the longer struct.
+/// The upgrade hook decodes it as the historical shape instead and maps
+/// it forward. The bytes stay private; [`Legacy::decode`] uses the
+/// store's own codec, so callers never name the encoding.
+pub struct Legacy<'a> {
+    bytes: &'a [u8],
+    codec: Codec,
+}
+
+impl Legacy<'_> {
+    /// Decode the blob as `T` (a historical row shape) with the store's
+    /// codec; `None` when it is not that shape either.
+    #[must_use]
+    pub fn decode<T: DeserializeOwned>(&self) -> Option<T> {
+        self.codec.decode(self.bytes).ok()
+    }
+}
+
+/// Decode one stored row: the current shape first, then the type's
+/// [`upgrade`](crate::Persistent::upgrade) hook. When both fail, the
+/// current-shape error is reported.
+pub(crate) fn decode_row<T: crate::Persistent>(
+    codec: Codec,
+    bytes: &[u8],
+) -> Result<T, StoreError> {
+    match codec.decode::<T>(bytes) {
+        Ok(value) => Ok(value),
+        Err(err) => T::upgrade(&Legacy { bytes, codec }).ok_or(err),
+    }
+}

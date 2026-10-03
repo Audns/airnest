@@ -37,14 +37,54 @@ pub(crate) fn is_unique_violation(e: &sqlx::Error) -> bool {
     let Some(db) = e.as_database_error() else {
         return false;
     };
-    matches!(db.code().as_deref(), Some("2067") | Some("23505"))
+    // 1555: SQLITE_CONSTRAINT_PRIMARYKEY (an `insert` over an existing id).
+    matches!(db.code().as_deref(), Some("2067" | "1555" | "23505"))
 }
 
 /// Sort direction.
+///
+/// Index columns are stored as TEXT, so `Asc`/`Desc` compare as text
+/// (`"10" < "9"`). `NumAsc`/`NumDesc` compare the column numerically:
+/// sequence numbers, generations, timestamps. Like [`SequenceGuard`],
+/// a cell that does not parse as an integer counts as 0.
 #[derive(Debug, Clone, Copy)]
 pub enum Order {
     Asc,
     Desc,
+    /// Ascending, comparing the column as a signed 64-bit integer.
+    NumAsc,
+    /// Descending, comparing the column as a signed 64-bit integer.
+    NumDesc,
+}
+
+impl Order {
+    /// Whether this order compares numerically.
+    #[must_use]
+    pub fn is_numeric(self) -> bool {
+        matches!(self, Self::NumAsc | Self::NumDesc)
+    }
+
+    /// Whether this order is descending.
+    #[must_use]
+    pub fn is_descending(self) -> bool {
+        matches!(self, Self::Desc | Self::NumDesc)
+    }
+
+    /// Compare two optional cells under this order (in-memory backends).
+    #[cfg_attr(not(feature = "redb"), allow(dead_code))]
+    pub(crate) fn compare(self, a: Option<&String>, b: Option<&String>) -> std::cmp::Ordering {
+        let ordering = if self.is_numeric() {
+            let num = |v: Option<&String>| v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+            num(a).cmp(&num(b))
+        } else {
+            a.cmp(&b)
+        };
+        if self.is_descending() {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    }
 }
 
 /// A structured query request dispatched to a [`Backend`].
@@ -194,6 +234,20 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<GuardOutcome, StoreError>;
 
     async fn query_count(&self, request: QueryRequest) -> Result<i64, StoreError>;
+
+    /// The stored blobs of matching rows, undecoded, in query order. The
+    /// lenient read path ([`Query::all_decodable`](crate::Query::all_decodable))
+    /// decodes them itself so one corrupt row cannot fail the whole read.
+    async fn query_blobs(&self, request: QueryRequest) -> Result<Vec<Vec<u8>>, StoreError>;
+
+    /// Delete every row of `T` matching `filters` (all rows when empty).
+    /// Returns how many rows were removed.
+    async fn delete_where<T: Persistent>(&self, filters: &[Filter]) -> Result<u64, StoreError>;
+
+    /// Insert a new row. Unlike [`save`](Backend::save) it never
+    /// overwrites: an existing id or a collision on a `unique(...)` group
+    /// is [`StoreError::Conflict`] and nothing is written.
+    async fn insert<T: Persistent>(&self, value: &T, codec: Codec) -> Result<(), StoreError>;
 
     async fn count_grouped_by<T: Persistent>(
         &self,

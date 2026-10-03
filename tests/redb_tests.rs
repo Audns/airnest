@@ -152,12 +152,20 @@ async fn redb_project_returns_columns_without_blobs() {
         .await
         .unwrap();
 
-    s.save(&Revision::new("chat/a".into(), "1".into(), "body-one".into()))
-        .await
-        .unwrap();
-    s.save(&Revision::new("chat/a".into(), "2".into(), "body-two".into()))
-        .await
-        .unwrap();
+    s.save(&Revision::new(
+        "chat/a".into(),
+        "1".into(),
+        "body-one".into(),
+    ))
+    .await
+    .unwrap();
+    s.save(&Revision::new(
+        "chat/a".into(),
+        "2".into(),
+        "body-two".into(),
+    ))
+    .await
+    .unwrap();
 
     let rows = s
         .find::<Revision>()
@@ -236,7 +244,9 @@ async fn redb_insert_guarded_concurrent_racers_land_exactly_once() {
         let s = s.clone();
         handles.push(tokio::spawn(async move {
             let r = Revision::new("chat/a".into(), "2".into(), format!("racer-{i}"));
-            s.insert_guarded(&r, &redb_seq_guard("chat/a", 2)).await.unwrap()
+            s.insert_guarded(&r, &redb_seq_guard("chat/a", 2))
+                .await
+                .unwrap()
         }));
     }
     let mut landed = 0;
@@ -247,4 +257,41 @@ async fn redb_insert_guarded_concurrent_racers_land_exactly_once() {
     }
     assert_eq!(landed, 1, "exactly one racer may land G2");
     assert_eq!(s.count::<Revision>().await.unwrap(), 2);
+}
+
+#[persistent(index(stream, seq), unique(stream, seq))]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct LogLine {
+    stream: String,
+    seq: u64,
+}
+
+#[tokio::test]
+async fn redb_insert_delete_numeric_order_and_lenient_reads() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let s = Store::open_redb(tmp.path().to_str().unwrap())
+        .await
+        .unwrap();
+    for seq in [9u64, 10, 2] {
+        s.insert(&LogLine::new("r".into(), seq)).await.unwrap();
+    }
+    assert!(matches!(
+        s.insert(&LogLine::new("r".into(), 9)).await,
+        Err(airnest::StoreError::Conflict(_))
+    ));
+    let asc: Vec<u64> = s
+        .find::<LogLine>()
+        .order_by("seq", airnest::Order::NumAsc)
+        .all()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(asc, vec![2, 9, 10]);
+    let read = s.find::<LogLine>().eq("stream", "r").all_decodable().await.unwrap();
+    assert_eq!((read.rows.len(), read.skipped), (3, 0));
+    assert_eq!(s.find::<LogLine>().eq("stream", "r").delete().await.unwrap(), 3);
+    // The unique keys went with the rows: the same seq inserts again.
+    s.insert(&LogLine::new("r".into(), 9)).await.unwrap();
 }

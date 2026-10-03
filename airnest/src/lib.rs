@@ -4,6 +4,9 @@
 //! architecture patterns for large codebases (persistence boundaries,
 //! aggregate-root modelling, repository layers, and more).
 
+#[cfg(test)]
+extern crate self as airnest;
+
 pub mod air_id;
 pub mod backend;
 pub mod codec;
@@ -17,15 +20,15 @@ pub mod store;
 pub use air_id::AirId;
 pub use airnest_macros::persistent;
 pub use backend::Order;
-pub use codec::Codec;
+pub use backend::{GuardOutcome, ProjectedRow, SequenceGuard};
+pub use codec::{Codec, Legacy};
 pub use error::StoreError;
 pub use index::ToIndexValue;
 pub use into_air_id::IntoAirId;
 pub use persistent::Persistent;
 pub use serde_helpers::{json_de, json_ser, json_string};
-pub use backend::{GuardOutcome, ProjectedRow, SequenceGuard};
 pub use store::{
-    BackendKind, InitMany, Query, ReplaceBuilder, Store, StoreBatch, UpsertBuilder,
+    BackendKind, Decoded, InitMany, Query, ReplaceBuilder, Store, StoreBatch, Tx, TxQuery, UpsertBuilder,
     UpsertModifyBuilder,
 };
 

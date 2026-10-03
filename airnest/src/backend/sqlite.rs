@@ -24,6 +24,36 @@ use crate::{
     persistent::Persistent,
 };
 
+/// Execution target for one statement: the shared pool or a
+/// transaction connection. Schema DDL and CRUD run either outside or
+/// inside a transaction without duplicating SQL construction.
+///
+/// DDL must run on the transaction's own connection: in-memory
+/// databases use a single pooled connection, so touching the pool
+/// while a transaction holds it would deadlock.
+pub(crate) enum Db<'a> {
+    Pool(&'a sqlx::SqlitePool),
+    Tx(&'a mut sqlx::SqliteConnection),
+}
+
+impl Db<'_> {
+    async fn execute(
+        &mut self,
+        sql: String,
+    ) -> Result<sqlx::sqlite::SqliteQueryResult, StoreError> {
+        match self {
+            Db::Pool(pool) => sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(*pool)
+                .await
+                .map_err(Into::into),
+            Db::Tx(tx) => sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut **tx)
+                .await
+                .map_err(Into::into),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SqliteBackend {
     pool: SqlitePool,
@@ -103,70 +133,231 @@ impl SqliteBackend {
         index_cols: &[&'static str],
         unique: &[&[&str]],
     ) -> Result<(), StoreError> {
+        // One DDL implementation for both targets: the pool here and a
+        // transaction connection in `ensure_table_in`.
+        let mut db = Db::Pool(&self.pool);
+        self.ensure_table_in(&mut db, table, index_cols, unique, true)
+            .await
+    }
+
+    /// The idempotent DDL behind [`SqliteBackend::ensure_table_raw`], on
+    /// either target.
+    ///
+    /// `remember` records the table as created. A transaction passes
+    /// `false`: its DDL rolls back with it, and a cache entry that
+    /// outlived the rollback would skip the DDL forever after
+    /// ("no such table"). Uncached tables in a transaction rerun the
+    /// `IF NOT EXISTS` statements instead.
+    async fn ensure_table_in(
+        &self,
+        db: &mut Db<'_>,
+        table: &'static str,
+        index_cols: &[&'static str],
+        unique: &[&[&str]],
+        remember: bool,
+    ) -> Result<(), StoreError> {
         {
             let guard = self.tables.read().map_err(|_| StoreError::Poisoned)?;
             if guard.contains(table) {
                 return Ok(());
             }
         }
-
         let schema = TableSchema {
             table,
             index_columns: index_cols,
         };
-        let create_sql = self.dialect.render_create_table(&schema);
-        sqlx::query(sqlx::AssertSqlSafe(&*create_sql))
-            .execute(&self.pool)
-            .await?;
-
-        // SQLite cannot add columns inside a CREATE TABLE for already-existing
-        // tables, so an idempotent ALTER is issued after the CREATE. CREATE
-        // TABLE IF NOT EXISTS is a no-op when the table already exists with
-        // the expected schema; the ALTER catches the case where it exists but
-        // is missing the column.
+        db.execute(self.dialect.render_create_table(&schema)).await?;
         for col in index_cols {
-            let add_sql = self.dialect.render_add_column(table, col);
-            // ALTER TABLE ADD COLUMN is not idempotent in SQLite, but ignoring
-            // the "duplicate column" error preserves the existing semantics.
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*add_sql))
-                .execute(&self.pool)
-                .await;
+            // ADD COLUMN is not idempotent in SQLite; the duplicate-column
+            // error is the expected no-op.
+            let _ = db.execute(self.dialect.render_add_column(table, col)).await;
         }
-
-        let saved_at_idx_sql = self.dialect.render_create_index(table, "saved_at");
-        sqlx::query(sqlx::AssertSqlSafe(&*saved_at_idx_sql))
-            .execute(&self.pool)
+        db.execute(self.dialect.render_create_index(table, "saved_at"))
             .await?;
-
         for col in index_cols {
-            let col_idx_sql = self.dialect.render_create_index(table, col);
-            sqlx::query(sqlx::AssertSqlSafe(&*col_idx_sql))
-                .execute(&self.pool)
-                .await?;
+            db.execute(self.dialect.render_create_index(table, col)).await?;
         }
-
-        // Additive: also applies to tables created before the constraint
-        // was declared. Pre-existing duplicate data fails here loudly
-        // rather than silently — clean it before declaring `unique(...)`.
         for group in unique {
-            let uniq_sql = self.dialect.render_create_unique_index(table, group);
-            sqlx::query(sqlx::AssertSqlSafe(&*uniq_sql))
-                .execute(&self.pool)
+            db.execute(self.dialect.render_create_unique_index(table, group))
                 .await?;
         }
-
-        // Cache upsert SQL now that schema is known.
         let upsert_sql = self.dialect.render_upsert(&schema);
         if let Ok(mut cache) = self.upsert_cache.write() {
             cache.insert(table.to_string(), upsert_sql);
         }
-
-        let mut guard = self.tables.write().map_err(|_| StoreError::Poisoned)?;
-        // Double-check after DDL in case another task raced and already inserted.
-        if !guard.contains(table) {
+        if remember {
+            let mut guard = self.tables.write().map_err(|_| StoreError::Poisoned)?;
             guard.insert(table);
         }
         Ok(())
+    }
+
+    async fn ensure_table_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        table: &'static str,
+        index_cols: &[&'static str],
+        unique: &[&[&str]],
+    ) -> Result<(), StoreError> {
+        let mut db = Db::Tx(tx);
+        self.ensure_table_in(&mut db, table, index_cols, unique, false)
+            .await
+    }
+
+    /// Typed upsert on a transaction connection.
+    pub(crate) async fn save_in<T: Persistent>(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        value: &T,
+        codec: Codec,
+    ) -> Result<(), StoreError> {
+        self.ensure_table_tx(tx, T::TABLE, T::index_columns(), T::unique_constraints())
+            .await?;
+        let id_bytes = value.id().to_bytes();
+        let v = codec.encode(value)?;
+        let schema = TableSchema {
+            table: T::TABLE,
+            index_columns: T::index_columns(),
+        };
+        let sql = self.cached_upsert(&schema);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        query = query.bind(&id_bytes[..]).bind(&v);
+        for val in value.index_values() {
+            query = query.bind(val);
+        }
+        query.execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    /// Typed point-read on a transaction connection.
+    pub(crate) async fn load_in<T: Persistent>(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        id_bytes: &[u8],
+        codec: Codec,
+    ) -> Result<Option<T>, StoreError> {
+        let sql = format!(
+            "SELECT v FROM {} WHERE {} = {}",
+            self.quote(T::TABLE),
+            self.quote("id"),
+            self.ph(1),
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(id_bytes)
+            .fetch_optional(&mut **tx)
+            .await?;
+        match row {
+            Some(r) => {
+                let bytes: Vec<u8> = r.get(0);
+                Ok(Some(crate::codec::decode_row::<T>(codec, &bytes)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Typed delete on a transaction connection.
+    pub(crate) async fn delete_in<T: Persistent>(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        id_bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let sql = format!(
+            "DELETE FROM {} WHERE {} = {}",
+            self.quote(T::TABLE),
+            self.quote("id"),
+            self.ph(1),
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(id_bytes)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Typed indexed query on a transaction connection.
+    pub(crate) async fn query_in<T: Persistent>(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        request: crate::backend::QueryRequest,
+        codec: Codec,
+    ) -> Result<Vec<T>, StoreError> {
+        self.ensure_table_tx(tx, T::TABLE, T::index_columns(), T::unique_constraints())
+            .await?;
+        let rendered = self.dialect.render_select(&request, "SELECT v");
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(rendered.sql.as_str()));
+        for p in rendered.binds {
+            query = query.bind(p);
+        }
+        let rows = query.fetch_all(&mut **tx).await?;
+        rows.into_iter()
+            .map(|r| {
+                let bytes: Vec<u8> = r.get(0);
+                crate::codec::decode_row::<T>(codec, &bytes)
+            })
+            .collect::<Result<Vec<T>, _>>()
+    }
+
+    /// Plain insert on a transaction connection (see [`Backend::insert`]).
+    pub(crate) async fn insert_in<T: Persistent>(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        value: &T,
+        codec: Codec,
+    ) -> Result<(), StoreError> {
+        self.ensure_table_tx(tx, T::TABLE, T::index_columns(), T::unique_constraints())
+            .await?;
+        let schema = TableSchema {
+            table: T::TABLE,
+            index_columns: T::index_columns(),
+        };
+        let sql = self.dialect.render_insert(&schema);
+        let id_bytes = value.id().to_bytes();
+        let v = codec.encode(value)?;
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        query = query.bind(&id_bytes[..]).bind(&v);
+        for val in value.index_values() {
+            query = query.bind(val);
+        }
+        match query.execute(&mut **tx).await {
+            Ok(_) => Ok(()),
+            Err(e) if crate::backend::is_unique_violation(&e) => Err(StoreError::Conflict(
+                format!("insert into `{}`: row exists", T::TABLE),
+            )),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
+    }
+
+    /// Filtered delete on a transaction connection.
+    pub(crate) async fn delete_where_in<T: Persistent>(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        filters: &[Filter],
+    ) -> Result<u64, StoreError> {
+        self.ensure_table_tx(tx, T::TABLE, T::index_columns(), T::unique_constraints())
+            .await?;
+        let rendered = self.dialect.render_delete_where(T::TABLE, filters);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(rendered.sql.as_str()));
+        for p in rendered.binds {
+            query = query.bind(p);
+        }
+        Ok(query.execute(&mut **tx).await?.rows_affected())
+    }
+
+    /// Undecoded blobs on a transaction connection (lenient reads).
+    pub(crate) async fn query_blobs_in<T: Persistent>(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        request: QueryRequest,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        self.ensure_table_tx(tx, T::TABLE, T::index_columns(), T::unique_constraints())
+            .await?;
+        let rendered = self.dialect.render_select(&request, "SELECT v");
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(rendered.sql.as_str()));
+        for p in rendered.binds {
+            query = query.bind(p);
+        }
+        let rows = query.fetch_all(&mut **tx).await?;
+        Ok(rows.into_iter().map(|r| r.get::<Vec<u8>, _>(0)).collect())
     }
 
     /// Composes a `SELECT v FROM <table> WHERE <column> IN (?, ?, ...)` SQL
@@ -241,7 +432,7 @@ impl Backend for SqliteBackend {
         match row {
             Some(r) => {
                 let bytes: Vec<u8> = r.get(0);
-                Ok(Some(codec.decode(&bytes)?))
+                Ok(Some(crate::codec::decode_row::<T>(codec, &bytes)?))
             }
             None => Ok(None),
         }
@@ -270,7 +461,7 @@ impl Backend for SqliteBackend {
             let rows = query.fetch_all(&self.pool).await?;
             for r in rows {
                 let bytes: Vec<u8> = r.get(0);
-                out.push(codec.decode(&bytes)?);
+                out.push(crate::codec::decode_row::<T>(codec, &bytes)?);
             }
         }
         Ok(out)
@@ -331,7 +522,7 @@ impl Backend for SqliteBackend {
         rows.into_iter()
             .map(|r| {
                 let bytes: Vec<u8> = r.get(0);
-                codec.decode(&bytes)
+                crate::codec::decode_row::<T>(codec, &bytes)
             })
             .collect::<Result<Vec<T>, _>>()
     }
@@ -362,9 +553,52 @@ impl Backend for SqliteBackend {
         rows.into_iter()
             .map(|r| {
                 let bytes: Vec<u8> = r.get(0);
-                codec.decode(&bytes)
+                crate::codec::decode_row::<T>(codec, &bytes)
             })
             .collect::<Result<Vec<T>, _>>()
+    }
+
+    async fn query_blobs(&self, request: QueryRequest) -> Result<Vec<Vec<u8>>, StoreError> {
+        let rendered = self.dialect.render_select(&request, "SELECT v");
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(rendered.sql.as_str()));
+        for p in rendered.binds {
+            query = query.bind(p);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|r| r.get::<Vec<u8>, _>(0)).collect())
+    }
+
+    async fn delete_where<T: Persistent>(&self, filters: &[Filter]) -> Result<u64, StoreError> {
+        self.ensure_table::<T>().await?;
+        let rendered = self.dialect.render_delete_where(T::TABLE, filters);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(rendered.sql.as_str()));
+        for p in rendered.binds {
+            query = query.bind(p);
+        }
+        Ok(query.execute(&self.pool).await?.rows_affected())
+    }
+
+    async fn insert<T: Persistent>(&self, value: &T, codec: Codec) -> Result<(), StoreError> {
+        self.ensure_table::<T>().await?;
+        let schema = TableSchema {
+            table: T::TABLE,
+            index_columns: T::index_columns(),
+        };
+        let sql = self.dialect.render_insert(&schema);
+        let id_bytes = value.id().to_bytes();
+        let v = codec.encode(value)?;
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        query = query.bind(&id_bytes[..]).bind(&v);
+        for val in value.index_values() {
+            query = query.bind(val);
+        }
+        match query.execute(&self.pool).await {
+            Ok(_) => Ok(()),
+            Err(e) if crate::backend::is_unique_violation(&e) => Err(StoreError::Conflict(
+                format!("insert into `{}`: row exists", T::TABLE),
+            )),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
     }
 
     async fn query_count(&self, request: QueryRequest) -> Result<i64, StoreError> {
@@ -410,9 +644,7 @@ impl Backend for SqliteBackend {
                     let mut id = [0u8; 16];
                     let len = raw.len().min(16);
                     id[..len].copy_from_slice(&raw[..len]);
-                    values.push(Some(
-                        uuid::Uuid::from_bytes(id).as_simple().to_string(),
-                    ));
+                    values.push(Some(uuid::Uuid::from_bytes(id).as_simple().to_string()));
                 } else {
                     // Index columns are TEXT; a row predating the column reads NULL.
                     let v: Option<String> = r.try_get(i).map_err(StoreError::Sqlite)?;
@@ -600,7 +832,7 @@ impl Backend for SqliteBackend {
         rows.into_iter()
             .map(|r| {
                 let bytes: Vec<u8> = r.get(0);
-                codec.decode(&bytes)
+                crate::codec::decode_row::<T>(codec, &bytes)
             })
             .collect()
     }

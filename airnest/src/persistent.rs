@@ -59,4 +59,17 @@ pub trait Persistent: Serialize + DeserializeOwned + Send + Sync + 'static {
     fn unique_constraints() -> &'static [&'static [&'static str]] {
         &[]
     }
+
+    /// Read a blob the current shape cannot decode: a row an older
+    /// binary wrote before the struct changed. Populated by
+    /// `#[persistent(upgrade = path)]`, where `path` is a
+    /// `fn(&Legacy<'_>) -> Option<Self>`.
+    ///
+    /// Every read path (load, query, scan, transactions) falls back to
+    /// this hook, so a migration lives beside the row type and never in
+    /// raw SQL. Defaults to `None`: an undecodable row stays an error.
+    fn upgrade(raw: &crate::codec::Legacy<'_>) -> Option<Self> {
+        let _ = raw;
+        None
+    }
 }

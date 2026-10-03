@@ -7,7 +7,7 @@
 use std::fmt::Write;
 
 use crate::backend::{
-    Filter, Order, QueryRequest,
+    Filter, QueryRequest,
     dialect::{RenderedSelect, SqlDialect, TableSchema},
 };
 
@@ -204,6 +204,10 @@ impl SqlDialect for SqliteDialect {
         )
     }
 
+    fn numeric_sort_expr(&self, quoted_column: &str) -> String {
+        format!("CAST({quoted_column} AS INTEGER)")
+    }
+
     fn render_select(&self, request: &QueryRequest, select_clause: &str) -> RenderedSelect {
         let mut sql = format!("{select_clause} FROM {}", self.quote_ident(request.table));
 
@@ -212,13 +216,7 @@ impl SqlDialect for SqliteDialect {
             let _ = write!(sql, " WHERE {where_clause}");
         }
 
-        for (col, order) in &request.order_by {
-            let dir = match order {
-                Order::Asc => "ASC",
-                Order::Desc => "DESC",
-            };
-            let _ = write!(sql, " ORDER BY {} {dir}", self.quote_ident(col));
-        }
+        sql.push_str(&self.render_order_by(&request.order_by));
 
         if let Some(n) = request.limit {
             let _ = write!(sql, " LIMIT {n}");

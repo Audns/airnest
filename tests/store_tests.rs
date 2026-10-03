@@ -254,11 +254,12 @@ async fn indexed_column_updated_on_save_upsert() {
 
     // Verify the real TEXT column was updated.
     let id_bytes = j.id().to_bytes();
-    let status: String = sqlx::query_scalar::<sqlx::Sqlite, String>(r#"SELECT "status" FROM "Job" WHERE id = ?1"#)
-        .bind(&id_bytes[..])
-        .fetch_one(s.pool().unwrap())
-        .await
-        .unwrap();
+    let status: String =
+        sqlx::query_scalar::<sqlx::Sqlite, String>(r#"SELECT "status" FROM "Job" WHERE id = ?1"#)
+            .bind(&id_bytes[..])
+            .fetch_one(s.pool().unwrap())
+            .await
+            .unwrap();
     assert_eq!(status, "done");
 }
 
@@ -716,14 +717,8 @@ async fn unique_macro_rejects_unknown_fields() {
         <Revision as airnest::Persistent>::unique_constraints(),
         &[&["session_id", "generation"] as &[&str]]
     );
-    assert!(
-        <Revision as airnest::Persistent>::index_columns()
-            .contains(&"session_id")
-    );
-    assert!(
-        <Revision as airnest::Persistent>::index_columns()
-            .contains(&"generation")
-    );
+    assert!(<Revision as airnest::Persistent>::index_columns().contains(&"session_id"));
+    assert!(<Revision as airnest::Persistent>::index_columns().contains(&"generation"));
 }
 
 // ── A2: projection reads ──────────────────────────────────────────────────
@@ -731,12 +726,20 @@ async fn unique_macro_rejects_unknown_fields() {
 #[tokio::test]
 async fn project_returns_columns_without_blobs() {
     let s = Store::in_memory().await.unwrap();
-    s.save(&Revision::new("chat/a".into(), "1".into(), "body-one".into()))
-        .await
-        .unwrap();
-    s.save(&Revision::new("chat/a".into(), "2".into(), "body-two".into()))
-        .await
-        .unwrap();
+    s.save(&Revision::new(
+        "chat/a".into(),
+        "1".into(),
+        "body-one".into(),
+    ))
+    .await
+    .unwrap();
+    s.save(&Revision::new(
+        "chat/a".into(),
+        "2".into(),
+        "body-two".into(),
+    ))
+    .await
+    .unwrap();
 
     let rows = s
         .find::<Revision>()
@@ -756,11 +759,7 @@ async fn project_returns_columns_without_blobs() {
 #[tokio::test]
 async fn project_rejects_unknown_and_empty_columns() {
     let s = Store::in_memory().await.unwrap();
-    let err = s
-        .find::<Revision>()
-        .project(&["v"])
-        .await
-        .unwrap_err();
+    let err = s.find::<Revision>().project(&["v"]).await.unwrap_err();
     assert!(
         matches!(err, airnest::StoreError::Codec(_)),
         "the blob is not projectable, got {err:?}"
@@ -811,13 +810,17 @@ async fn insert_guarded_lands_monotonic_writes() {
     // Empty partition: first write lands.
     let r1 = Revision::new("chat/a".into(), "1".into(), "one".into());
     assert_eq!(
-        s.insert_guarded(&r1, &seq_guard("chat/a", 1)).await.unwrap(),
+        s.insert_guarded(&r1, &seq_guard("chat/a", 1))
+            .await
+            .unwrap(),
         GuardOutcome::Landed
     );
     // Forward: lands.
     let r2 = Revision::new("chat/a".into(), "2".into(), "two".into());
     assert_eq!(
-        s.insert_guarded(&r2, &seq_guard("chat/a", 2)).await.unwrap(),
+        s.insert_guarded(&r2, &seq_guard("chat/a", 2))
+            .await
+            .unwrap(),
         GuardOutcome::Landed
     );
     // Stale: rejected, nothing written.
@@ -832,7 +835,9 @@ async fn insert_guarded_lands_monotonic_writes() {
     // Equal: rejected as well (max == N, not < N).
     let dup = Revision::new("chat/a".into(), "2".into(), "dupe".into());
     assert_eq!(
-        s.insert_guarded(&dup, &seq_guard("chat/a", 2)).await.unwrap(),
+        s.insert_guarded(&dup, &seq_guard("chat/a", 2))
+            .await
+            .unwrap(),
         GuardOutcome::Rejected
     );
     assert_eq!(s.count::<Revision>().await.unwrap(), 2);
@@ -919,9 +924,13 @@ async fn insert_guarded_rejects_unknown_columns() {
 async fn project_id_supports_metadata_only_deletes() {
     let s = Store::in_memory().await.unwrap();
     for generation in ["1", "2", "3"] {
-        s.save(&Revision::new("chat/a".into(), generation.into(), "x".into()))
-            .await
-            .unwrap();
+        s.save(&Revision::new(
+            "chat/a".into(),
+            generation.into(),
+            "x".into(),
+        ))
+        .await
+        .unwrap();
     }
     // Find old revisions by metadata, delete by projected id: no blob
     // is ever materialized.
@@ -934,7 +943,9 @@ async fn project_id_supports_metadata_only_deletes() {
     assert_eq!(rows.len(), 3);
     for row in &rows {
         if row.get("generation") != Some("3") {
-            s.delete_id::<Revision>(row.get("id").unwrap()).await.unwrap();
+            s.delete_id::<Revision>(row.get("id").unwrap())
+                .await
+                .unwrap();
         }
     }
     assert_eq!(s.count::<Revision>().await.unwrap(), 1);
@@ -947,4 +958,278 @@ async fn project_id_supports_metadata_only_deletes() {
         .unwrap();
     let loaded: Revision = s.load(keep.id()).await.unwrap().unwrap();
     assert_eq!(loaded.generation, "3");
+}
+
+// ── adapter completeness: upgrade, lenient reads, delete, insert, numeric order ──
+
+/// The shape an older binary wrote: same table name (`Note`), one field fewer.
+mod note_v1 {
+    use airnest::persistent;
+    use serde::{Deserialize, Serialize};
+
+    #[persistent(index(book))]
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    pub struct Note {
+        pub book: String,
+        pub text: String,
+    }
+}
+
+/// The current shape: a field appended, with an upgrade for v1 blobs.
+mod note_v2 {
+    use airnest::{AirId, Legacy, persistent};
+    use serde::{Deserialize, Serialize};
+
+    #[persistent(index(book), upgrade = Note::from_legacy)]
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    pub struct Note {
+        pub book: String,
+        pub text: String,
+        pub pinned: Option<bool>,
+    }
+
+    #[derive(Deserialize)]
+    struct NoteV1 {
+        id: AirId<NoteV1>,
+        book: String,
+        text: String,
+    }
+
+    impl Note {
+        fn from_legacy(raw: &Legacy<'_>) -> Option<Self> {
+            let old: NoteV1 = raw.decode()?;
+            Some(Self {
+                id: AirId::from_bytes(old.id.to_bytes()),
+                book: old.book,
+                text: old.text,
+                pinned: None,
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn upgrade_hook_reads_rows_an_older_shape_wrote() {
+    let s = Store::in_memory().await.unwrap();
+    let old = note_v1::Note::new("b".into(), "kept".into());
+    s.save(&old).await.unwrap();
+
+    // Point read, query, and scan all fall back to the hook.
+    let id = AirId::<note_v2::Note>::from_bytes(old.id().to_bytes());
+    let loaded = s.load(id).await.unwrap().expect("upgraded on load");
+    assert_eq!((loaded.text.as_str(), loaded.pinned), ("kept", None));
+    let queried = s.find::<note_v2::Note>().eq("book", "b").all().await.unwrap();
+    assert_eq!(queried, vec![loaded.clone()]);
+    assert_eq!(s.scan::<note_v2::Note>().await.unwrap(), vec![loaded]);
+}
+
+#[tokio::test]
+async fn upgrade_hook_runs_inside_transactions() {
+    let s = Store::in_memory().await.unwrap();
+    s.save(&note_v1::Note::new("b".into(), "old".into()))
+        .await
+        .unwrap();
+    let text = s
+        .transaction::<_, airnest::StoreError, _>(|tx| {
+            Box::pin(async move {
+                let row = tx.find::<note_v2::Note>().eq("book", "b").first().await?;
+                Ok(row.map(|row| row.text))
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(text.as_deref(), Some("old"));
+}
+
+#[persistent(index(book))]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct Strict {
+    book: String,
+    count: u64,
+    label: String,
+}
+
+mod strict_garbage {
+    use airnest::persistent;
+    use serde::{Deserialize, Serialize};
+
+    /// A row no shape (and no upgrade) of `Strict` can read.
+    #[persistent(index(book))]
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    pub struct Strict {
+        pub book: String,
+    }
+}
+
+#[tokio::test]
+async fn all_decodable_skips_rows_that_never_decode() {
+    let s = Store::in_memory().await.unwrap();
+    s.save(&Strict::new("b".into(), 1, "good".into()))
+        .await
+        .unwrap();
+    s.save(&strict_garbage::Strict::new("b".into()))
+        .await
+        .unwrap();
+
+    assert!(
+        s.find::<Strict>().eq("book", "b").all().await.is_err(),
+        "the strict read fails on the bad row"
+    );
+    let read = s
+        .find::<Strict>()
+        .eq("book", "b")
+        .all_decodable()
+        .await
+        .unwrap();
+    assert_eq!(read.rows.len(), 1);
+    assert_eq!(read.rows[0].label, "good");
+    assert_eq!(read.skipped, 1);
+}
+
+#[tokio::test]
+async fn query_delete_removes_only_matching_rows() {
+    let s = Store::in_memory().await.unwrap();
+    for status in ["done", "done", "open"] {
+        s.save(&Job::new(status.into(), 1, String::new()))
+            .await
+            .unwrap();
+    }
+    let removed = s.find::<Job>().eq("status", "done").delete().await.unwrap();
+    assert_eq!(removed, 2);
+    assert_eq!(s.count::<Job>().await.unwrap(), 1);
+    // A never-created table deletes nothing instead of failing.
+    assert_eq!(s.find::<Strict>().delete().await.unwrap(), 0);
+}
+
+#[persistent(index(stream, seq), unique(stream, seq))]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct LogLine {
+    stream: String,
+    seq: u64,
+    text: String,
+}
+
+#[tokio::test]
+async fn insert_never_overwrites() {
+    let s = Store::in_memory().await.unwrap();
+    let first = LogLine::new("r".into(), 1, "a".into());
+    s.insert(&first).await.unwrap();
+
+    // Same id: conflict, original kept.
+    let mut again = first.clone();
+    again.text = "b".into();
+    assert!(matches!(
+        s.insert(&again).await,
+        Err(airnest::StoreError::Conflict(_))
+    ));
+    // Same unique group, fresh id: conflict too.
+    assert!(matches!(
+        s.insert(&LogLine::new("r".into(), 1, "c".into())).await,
+        Err(airnest::StoreError::Conflict(_))
+    ));
+    assert_eq!(s.load(first.id()).await.unwrap().unwrap().text, "a");
+}
+
+#[tokio::test]
+async fn numeric_order_sorts_sequences_as_numbers() {
+    let s = Store::in_memory().await.unwrap();
+    for seq in [9u64, 10, 2] {
+        s.insert(&LogLine::new("r".into(), seq, String::new()))
+            .await
+            .unwrap();
+    }
+    let seqs = |rows: Vec<LogLine>| rows.into_iter().map(|r| r.seq).collect::<Vec<_>>();
+    let text = s
+        .find::<LogLine>()
+        .order_by("seq", airnest::Order::Asc)
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(seqs(text), vec![10, 2, 9], "text order, for contrast");
+    let asc = s
+        .find::<LogLine>()
+        .order_by("seq", airnest::Order::NumAsc)
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(seqs(asc), vec![2, 9, 10]);
+    let desc = s
+        .find::<LogLine>()
+        .order_by("seq", airnest::Order::NumDesc)
+        .limit(1)
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(seqs(desc), vec![10]);
+}
+
+#[tokio::test]
+async fn several_order_keys_render_one_clause() {
+    let s = Store::in_memory().await.unwrap();
+    for (stream, seq) in [("b", 1u64), ("a", 2), ("a", 1)] {
+        s.insert(&LogLine::new(stream.into(), seq, String::new()))
+            .await
+            .unwrap();
+    }
+    let rows = s
+        .find::<LogLine>()
+        .order_by("stream", airnest::Order::Asc)
+        .order_by("seq", airnest::Order::NumAsc)
+        .all()
+        .await
+        .unwrap();
+    let keys: Vec<_> = rows.iter().map(|r| (r.stream.as_str(), r.seq)).collect();
+    assert_eq!(keys, vec![("a", 1), ("a", 2), ("b", 1)]);
+}
+
+#[tokio::test]
+async fn transaction_insert_delete_and_lenient_reads_share_the_transaction() {
+    let s = Store::in_memory().await.unwrap();
+    s.save(&strict_garbage::Strict::new("b".into()))
+        .await
+        .unwrap();
+    let (conflicted, skipped, removed) = s
+        .transaction::<_, airnest::StoreError, _>(|tx| {
+            Box::pin(async move {
+                tx.insert(&LogLine::new("r".into(), 1, "a".into())).await?;
+                let conflicted = matches!(
+                    tx.insert(&LogLine::new("r".into(), 1, "b".into())).await,
+                    Err(airnest::StoreError::Conflict(_))
+                );
+                let skipped = tx
+                    .find::<Strict>()
+                    .eq("book", "b")
+                    .all_decodable()
+                    .await?
+                    .skipped;
+                let removed = tx.find::<Strict>().eq("book", "b").delete().await?;
+                Ok((conflicted, skipped, removed))
+            })
+        })
+        .await
+        .unwrap();
+    assert!(conflicted, "a conflict inside the transaction is reported, not fatal");
+    assert_eq!((skipped, removed), (1, 1));
+    assert_eq!(s.count::<LogLine>().await.unwrap(), 1);
+    assert_eq!(s.count::<Strict>().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_rolled_back_transaction_does_not_forget_the_table() {
+    // The first touch of a table happens inside a transaction that rolls
+    // back: the CREATE goes with it, and later reads must recreate it
+    // rather than trust a stale "already created".
+    let s = Store::in_memory().await.unwrap();
+    let failed = s
+        .transaction::<(), airnest::StoreError, _>(|tx| {
+            Box::pin(async move {
+                tx.save(&LogLine::new("r".into(), 1, "a".into())).await?;
+                Err(airnest::StoreError::Codec("refused".into()))
+            })
+        })
+        .await;
+    assert!(failed.is_err());
+    assert_eq!(s.count::<LogLine>().await.unwrap(), 0);
+    s.insert(&LogLine::new("r".into(), 1, "b".into())).await.unwrap();
+    assert_eq!(s.count::<LogLine>().await.unwrap(), 1);
 }

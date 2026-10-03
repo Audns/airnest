@@ -241,6 +241,46 @@ impl BackendImpl {
         }
     }
 
+    async fn query_blobs(&self, request: QueryRequest) -> Result<Vec<Vec<u8>>, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.query_blobs(request).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.query_blobs(request).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.query_blobs(request).await,
+        }
+    }
+
+    async fn delete_where<T: Persistent>(&self, filters: &[Filter]) -> Result<u64, StoreError> {
+        match self {
+            Self::Sqlite(b) => b.delete_where::<T>(filters).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.delete_where::<T>(filters).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.delete_where::<T>(filters).await,
+        }
+    }
+
+    async fn insert<T: Persistent>(&self, value: &T, codec: Codec) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite(b) => b.insert(value, codec).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(b) => b.insert(value, codec).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(b) => b.insert(value, codec).await,
+        }
+    }
+
+    fn as_sqlite_backend(&self) -> Option<&SqliteBackend> {
+        match self {
+            Self::Sqlite(b) => Some(b),
+            #[cfg(feature = "redb")]
+            Self::Redb(_) => None,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => None,
+        }
+    }
+
     fn as_sqlite_pool(&self) -> Option<&sqlx::SqlitePool> {
         match self {
             Self::Sqlite(b) => b.as_sqlite_pool(),
@@ -395,9 +435,9 @@ impl Store {
     /// redb backend raises `Conflict` directly.
     fn collapse_conflict<T>(result: Result<T, StoreError>, what: &str) -> Result<T, StoreError> {
         match result {
-            Err(StoreError::Sqlite(e)) if crate::backend::is_unique_violation(&e) => {
-                Err(StoreError::Conflict(format!("{what}: unique constraint violated")))
-            }
+            Err(StoreError::Sqlite(e)) if crate::backend::is_unique_violation(&e) => Err(
+                StoreError::Conflict(format!("{what}: unique constraint violated")),
+            ),
             r => r,
         }
     }
@@ -410,6 +450,19 @@ impl Store {
     pub async fn save<T: Persistent>(&self, value: &T) -> Result<(), StoreError> {
         self.ensure_table::<T>().await?;
         Self::collapse_conflict(self.inner.save(value, self.codec).await, T::TABLE)
+    }
+
+    /// Insert a new value; never overwrites. An existing id, or a
+    /// collision on a declared `unique(...)` group, is
+    /// [`StoreError::Conflict`] and nothing is written: the insert-only
+    /// primitive ("create unless it exists", exactly-once markers).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] on a collision; the backend's failure
+    /// otherwise.
+    pub async fn insert<T: Persistent>(&self, value: &T) -> Result<(), StoreError> {
+        self.inner.insert(value, self.codec).await
     }
 
     /// Load a value by id. Accepts an [`AirId`](crate::AirId) or a reference to the value itself.
@@ -560,9 +613,7 @@ impl Store {
         // A lost UNIQUE race is Rejected by contract, on every backend.
         match self.inner.insert_guarded(value, guard, self.codec).await {
             Err(StoreError::Conflict(_)) => Ok(crate::backend::GuardOutcome::Rejected),
-            Err(StoreError::Sqlite(e))
-                if crate::backend::is_unique_violation(&e) =>
-            {
+            Err(StoreError::Sqlite(e)) if crate::backend::is_unique_violation(&e) => {
                 Ok(crate::backend::GuardOutcome::Rejected)
             }
             r => r,
@@ -586,6 +637,64 @@ impl Store {
     #[must_use]
     pub fn pool(&self) -> Option<&sqlx::SqlitePool> {
         self.inner.as_sqlite_pool()
+    }
+
+    /// Run `f` inside one `SQLite` transaction. Typed operations on the
+    /// [`Tx`] handle share the transaction; `f`'s error type carries the
+    /// caller's domain error (anything convertible from [`StoreError`]).
+    /// Commits when `f` returns `Ok`, rolls back on `Err`.
+    ///
+    /// SQLite only: a backend without transactions answers
+    /// [`StoreError::Codec`]. Schema DDL for the first typed operation
+    /// runs on the transaction's own connection, so a single-connection
+    /// in-memory database cannot deadlock.
+    ///
+    /// # Errors
+    ///
+    /// `f`'s error, or the begin/commit failure.
+    pub async fn transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StoreError>,
+        F: for<'a> FnOnce(
+            &'a mut Tx<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'a>,
+        >,
+    {
+        let Some(backend) = self.inner.as_sqlite_backend() else {
+            return Err(E::from(StoreError::Codec(
+                "transactions require the SQLite backend".into(),
+            )));
+        };
+        let pool = backend
+            .as_sqlite_pool()
+            .expect("the SQLite backend always has a pool");
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StoreError::from)
+            .map_err(E::from)?;
+        let outcome = {
+            let mut handle = Tx {
+                backend,
+                tx: &mut tx,
+                codec: self.codec,
+            };
+            f(&mut handle).await
+        };
+        match outcome {
+            Ok(value) => {
+                tx.commit()
+                    .await
+                    .map_err(StoreError::from)
+                    .map_err(E::from)?;
+                Ok(value)
+            }
+            Err(err) => {
+                tx.rollback().await.ok();
+                Err(err)
+            }
+        }
     }
 
     // ── bulk / set helpers ────────────────────────────────────────────────────
@@ -636,6 +745,206 @@ impl Store {
     #[must_use]
     pub fn batch(&self) -> StoreBatch {
         StoreBatch::with_codec(self.codec)
+    }
+}
+
+// ── Transaction handle ───────────────────────────────────────────────────────
+
+/// Typed handle over one `SQLite` transaction (see [`Store::transaction`]).
+///
+/// Operations on this handle run on the transaction's connection, so a
+/// caller can verify a guard (for example a runtime fence) and mutate in
+/// the same atomic unit.
+pub struct Tx<'a> {
+    backend: &'a SqliteBackend,
+    tx: &'a mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    codec: Codec,
+}
+
+impl Tx<'_> {
+    /// Upsert one value inside the transaction.
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure.
+    pub async fn save<T: Persistent>(&mut self, value: &T) -> Result<(), StoreError> {
+        self.backend.save_in(&mut *self.tx, value, self.codec).await
+    }
+
+    /// Insert a new value inside the transaction; never overwrites (see
+    /// [`Store::insert`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Conflict`] on an existing id or unique group; the
+    /// backend's failure otherwise. A conflict leaves the transaction
+    /// usable.
+    pub async fn insert<T: Persistent>(&mut self, value: &T) -> Result<(), StoreError> {
+        self.backend.insert_in(&mut *self.tx, value, self.codec).await
+    }
+
+    /// Load one value by id inside the transaction.
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure.
+    pub async fn load<T: Persistent, I: IntoAirId<T>>(
+        &mut self,
+        input: I,
+    ) -> Result<Option<T>, StoreError> {
+        let id = input.into_air_id();
+        self.backend
+            .load_in::<T>(&mut *self.tx, &id.to_bytes(), self.codec)
+            .await
+    }
+
+    /// Delete one value inside the transaction.
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure.
+    pub async fn delete<T: Persistent>(&mut self, value: &T) -> Result<(), StoreError> {
+        self.backend
+            .delete_in::<T>(&mut *self.tx, &value.id().to_bytes())
+            .await
+    }
+
+    /// The underlying `sqlx` transaction, for primitives that must run
+    /// on the same connection (for example a runtime-fence guard check).
+    /// Typed operations remain the preferred path.
+    pub fn transaction_mut(&mut self) -> &mut sqlx::Transaction<'static, sqlx::Sqlite> {
+        self.tx
+    }
+
+    /// Typed query builder bound to the transaction.
+    #[must_use]
+    pub fn find<T: Persistent>(&mut self) -> TxQuery<'_, T> {
+        TxQuery {
+            backend: self.backend,
+            tx: &mut *self.tx,
+            codec: self.codec,
+            filters: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Typed query builder for [`Tx`]: the transaction-scoped twin of
+/// [`Query`], with the filters the session writers use.
+pub struct TxQuery<'a, T: Persistent> {
+    backend: &'a SqliteBackend,
+    tx: &'a mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    codec: Codec,
+    filters: Vec<Filter>,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T: Persistent> TxQuery<'a, T> {
+    /// Filter where `column` equals `value`.
+    #[must_use]
+    pub fn eq<V: ToIndexValue + ?Sized>(mut self, column: &str, value: &V) -> Self {
+        self.filters
+            .push(Filter::Eq(column.to_string(), value.to_index_value()));
+        self
+    }
+
+    /// Execute the query and return all matching rows.
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure.
+    pub async fn all(self) -> Result<Vec<T>, StoreError> {
+        for f in &self.filters {
+            if let Filter::In(_, vals) = f
+                && vals.is_empty()
+            {
+                return Ok(vec![]);
+            }
+        }
+        let request = QueryRequest {
+            table: T::TABLE,
+            filters: self.filters,
+            order_by: Vec::new(),
+            limit: None,
+        };
+        self.backend
+            .query_in::<T>(self.tx, request, self.codec)
+            .await
+    }
+
+    /// Execute the query and return at most one row.
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure.
+    pub async fn first(self) -> Result<Option<T>, StoreError> {
+        let mut rows = self.all().await?;
+        Ok(rows.pop())
+    }
+
+    /// Lenient read inside the transaction (see [`Query::all_decodable`]).
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure (never a decode failure).
+    pub async fn all_decodable(self) -> Result<Decoded<T>, StoreError> {
+        let request = QueryRequest {
+            table: T::TABLE,
+            filters: self.filters,
+            order_by: Vec::new(),
+            limit: None,
+        };
+        let blobs = self
+            .backend
+            .query_blobs_in::<T>(self.tx, request)
+            .await?;
+        Ok(Decoded::from_blobs(self.codec, &blobs))
+    }
+
+    /// Delete every matching row inside the transaction; returns how many
+    /// were removed.
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure.
+    pub async fn delete(self) -> Result<u64, StoreError> {
+        self.backend
+            .delete_where_in::<T>(self.tx, &self.filters)
+            .await
+    }
+}
+
+// ── Lenient reads ────────────────────────────────────────────────────────────
+
+/// Rows read leniently ([`Query::all_decodable`]): every row that decoded,
+/// in query order, plus how many did not.
+#[derive(Debug)]
+pub struct Decoded<T> {
+    /// The rows that decoded (directly or through `upgrade`).
+    pub rows: Vec<T>,
+    /// How many matching rows decoded neither way.
+    pub skipped: usize,
+}
+
+impl<T> Default for Decoded<T> {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            skipped: 0,
+        }
+    }
+}
+
+impl<T: Persistent> Decoded<T> {
+    fn from_blobs(codec: Codec, blobs: &[Vec<u8>]) -> Self {
+        let mut out = Self::default();
+        for blob in blobs {
+            match crate::codec::decode_row::<T>(codec, blob) {
+                Ok(row) => out.rows.push(row),
+                Err(_) => out.skipped += 1,
+            }
+        }
+        out
     }
 }
 
@@ -723,6 +1032,46 @@ impl<'a, T: Persistent> Query<'a, T> {
     pub async fn first(self) -> Result<Option<T>, StoreError> {
         let mut rows = self.limit(1).all().await?;
         Ok(rows.pop())
+    }
+
+    /// Execute the query, decoding each row on its own: rows that fail
+    /// to decode (after the type's `upgrade` hook) are counted in
+    /// [`Decoded::skipped`] instead of failing the read. For listings
+    /// where one corrupt row must not hide the rest.
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure (never a decode failure).
+    pub async fn all_decodable(self) -> Result<Decoded<T>, StoreError> {
+        self.store.ensure_table::<T>().await?;
+        for f in &self.filters {
+            if let Filter::In(_, vals) = f
+                && vals.is_empty()
+            {
+                return Ok(Decoded::default());
+            }
+        }
+        let request = self.to_request();
+        let blobs = self.store.inner.query_blobs(request).await?;
+        Ok(Decoded::from_blobs(self.store.codec, &blobs))
+    }
+
+    /// Delete every matching row; returns how many were removed. Only the
+    /// filters apply (ordering and limit are ignored). A query with no
+    /// filters deletes every row of `T`.
+    ///
+    /// # Errors
+    ///
+    /// The backend's failure.
+    pub async fn delete(self) -> Result<u64, StoreError> {
+        for f in &self.filters {
+            if let Filter::In(_, vals) = f
+                && vals.is_empty()
+            {
+                return Ok(0);
+            }
+        }
+        self.store.inner.delete_where::<T>(&self.filters).await
     }
 
     /// Count matching rows without decoding blobs.
@@ -968,3 +1317,66 @@ impl_init_many!(A, B, C, D, E, F, G, H, I);
 impl_init_many!(A, B, C, D, E, F, G, H, I, J);
 impl_init_many!(A, B, C, D, E, F, G, H, I, J, K);
 impl_init_many!(A, B, C, D, E, F, G, H, I, J, K, L);
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate as airnest;
+    use crate::persistent;
+
+    #[persistent(index(group))]
+    #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+    struct Widget {
+        group: String,
+        label: String,
+    }
+
+    #[tokio::test]
+    async fn transaction_commits_and_rolls_back_with_its_mutations() {
+        let store = Store::in_memory().await.expect("memory store");
+
+        // Commit: the typed save shares the transaction and lands.
+        store
+            .transaction::<_, StoreError, _>(|tx| {
+                Box::pin(async move {
+                    let first = Widget::new("g".to_string(), "kept".to_string());
+                    tx.save(&first).await?;
+                    let listed = tx.find::<Widget>().eq("group", "g").all().await?;
+                    assert_eq!(listed.len(), 1, "a read inside the transaction sees it");
+                    Ok(())
+                })
+            })
+            .await
+            .expect("commit");
+
+        let rows = store
+            .find::<Widget>()
+            .eq("group", "g")
+            .all()
+            .await
+            .expect("read");
+        assert_eq!(rows.len(), 1);
+
+        // Rollback: the domain error is preserved and nothing lands.
+        let err = store
+            .transaction::<(), StoreError, _>(|tx| {
+                Box::pin(async move {
+                    tx.save(&Widget::new("g".to_string(), "dropped".to_string()))
+                        .await?;
+                    Err(StoreError::Codec("caller refused".into()))
+                })
+            })
+            .await
+            .expect_err("rollback");
+        assert!(matches!(err, StoreError::Codec(_)));
+        let rows = store
+            .find::<Widget>()
+            .eq("group", "g")
+            .all()
+            .await
+            .expect("read");
+        assert_eq!(rows.len(), 1, "the rolled-back row is absent");
+        assert_eq!(rows[0].label, "kept");
+    }
+}
