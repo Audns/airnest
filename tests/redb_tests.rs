@@ -289,9 +289,21 @@ async fn redb_insert_delete_numeric_order_and_lenient_reads() {
         .map(|r| r.seq)
         .collect();
     assert_eq!(asc, vec![2, 9, 10]);
-    let read = s.find::<LogLine>().eq("stream", "r").all_decodable().await.unwrap();
+    let read = s
+        .find::<LogLine>()
+        .eq("stream", "r")
+        .all_decodable()
+        .await
+        .unwrap();
     assert_eq!((read.rows.len(), read.skipped), (3, 0));
-    assert_eq!(s.find::<LogLine>().eq("stream", "r").delete().await.unwrap(), 3);
+    assert_eq!(
+        s.find::<LogLine>()
+            .eq("stream", "r")
+            .delete()
+            .await
+            .unwrap(),
+        3
+    );
     // The unique keys went with the rows: the same seq inserts again.
     s.insert(&LogLine::new("r".into(), 9)).await.unwrap();
 }

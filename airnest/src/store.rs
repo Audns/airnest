@@ -271,6 +271,13 @@ impl BackendImpl {
         }
     }
 
+    // The `Option` is required only when a non-SQLite backend variant
+    // exists, so `transaction` can reject it. In a SQLite-only build the
+    // wrapper is vacuous and `unnecessary_wraps` fires.
+    #[cfg_attr(
+        not(any(feature = "redb", feature = "postgres")),
+        allow(clippy::unnecessary_wraps)
+    )]
     fn as_sqlite_backend(&self) -> Option<&SqliteBackend> {
         match self {
             Self::Sqlite(b) => Some(b),
@@ -677,7 +684,7 @@ impl Store {
         let outcome = {
             let mut handle = Tx {
                 backend,
-                tx: &mut tx,
+                transaction: &mut tx,
                 codec: self.codec,
             };
             f(&mut handle).await
@@ -757,7 +764,7 @@ impl Store {
 /// the same atomic unit.
 pub struct Tx<'a> {
     backend: &'a SqliteBackend,
-    tx: &'a mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    transaction: &'a mut sqlx::Transaction<'static, sqlx::Sqlite>,
     codec: Codec,
 }
 
@@ -768,7 +775,9 @@ impl Tx<'_> {
     ///
     /// The backend's failure.
     pub async fn save<T: Persistent>(&mut self, value: &T) -> Result<(), StoreError> {
-        self.backend.save_in(&mut *self.tx, value, self.codec).await
+        self.backend
+            .save_in(&mut *self.transaction, value, self.codec)
+            .await
     }
 
     /// Insert a new value inside the transaction; never overwrites (see
@@ -780,7 +789,9 @@ impl Tx<'_> {
     /// backend's failure otherwise. A conflict leaves the transaction
     /// usable.
     pub async fn insert<T: Persistent>(&mut self, value: &T) -> Result<(), StoreError> {
-        self.backend.insert_in(&mut *self.tx, value, self.codec).await
+        self.backend
+            .insert_in(&mut *self.transaction, value, self.codec)
+            .await
     }
 
     /// Load one value by id inside the transaction.
@@ -794,7 +805,7 @@ impl Tx<'_> {
     ) -> Result<Option<T>, StoreError> {
         let id = input.into_air_id();
         self.backend
-            .load_in::<T>(&mut *self.tx, &id.to_bytes(), self.codec)
+            .load_in::<T>(&mut *self.transaction, &id.to_bytes(), self.codec)
             .await
     }
 
@@ -805,7 +816,7 @@ impl Tx<'_> {
     /// The backend's failure.
     pub async fn delete<T: Persistent>(&mut self, value: &T) -> Result<(), StoreError> {
         self.backend
-            .delete_in::<T>(&mut *self.tx, &value.id().to_bytes())
+            .delete_in::<T>(&mut *self.transaction, &value.id().to_bytes())
             .await
     }
 
@@ -813,7 +824,7 @@ impl Tx<'_> {
     /// on the same connection (for example a runtime-fence guard check).
     /// Typed operations remain the preferred path.
     pub fn transaction_mut(&mut self) -> &mut sqlx::Transaction<'static, sqlx::Sqlite> {
-        self.tx
+        self.transaction
     }
 
     /// Typed query builder bound to the transaction.
@@ -821,7 +832,7 @@ impl Tx<'_> {
     pub fn find<T: Persistent>(&mut self) -> TxQuery<'_, T> {
         TxQuery {
             backend: self.backend,
-            tx: &mut *self.tx,
+            tx: &mut *self.transaction,
             codec: self.codec,
             filters: Vec::new(),
             _phantom: PhantomData,
@@ -839,7 +850,7 @@ pub struct TxQuery<'a, T: Persistent> {
     _phantom: PhantomData<T>,
 }
 
-impl<'a, T: Persistent> TxQuery<'a, T> {
+impl<T: Persistent> TxQuery<'_, T> {
     /// Filter where `column` equals `value`.
     #[must_use]
     pub fn eq<V: ToIndexValue + ?Sized>(mut self, column: &str, value: &V) -> Self {
@@ -894,10 +905,7 @@ impl<'a, T: Persistent> TxQuery<'a, T> {
             order_by: Vec::new(),
             limit: None,
         };
-        let blobs = self
-            .backend
-            .query_blobs_in::<T>(self.tx, request)
-            .await?;
+        let blobs = self.backend.query_blobs_in::<T>(self.tx, request).await?;
         Ok(Decoded::from_blobs(self.codec, &blobs))
     }
 
@@ -1283,6 +1291,7 @@ pub trait InitMany {
 }
 
 impl InitMany for () {
+    #[allow(clippy::unused_async_trait_impl)]
     async fn init(_store: &Store) -> Result<(), StoreError> {
         Ok(())
     }

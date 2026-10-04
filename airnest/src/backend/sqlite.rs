@@ -74,10 +74,10 @@ impl SqliteBackend {
                 .connect("sqlite::memory:")
                 .await?
         } else {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
+            if let Some(parent) = std::path::Path::new(path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                tokio::fs::create_dir_all(parent).await?;
             }
             let mut options = SqliteConnectOptions::new()
                 .filename(path)
@@ -114,10 +114,10 @@ impl SqliteBackend {
 
     fn cached_upsert(&self, schema: &TableSchema) -> String {
         // Fast-path: read lock
-        if let Ok(cache) = self.upsert_cache.read() {
-            if let Some(sql) = cache.get(schema.table) {
-                return sql.clone();
-            }
+        if let Ok(cache) = self.upsert_cache.read()
+            && let Some(sql) = cache.get(schema.table)
+        {
+            return sql.clone();
         }
         // Miss: render and populate
         let sql = self.dialect.render_upsert(schema);
@@ -166,7 +166,8 @@ impl SqliteBackend {
             table,
             index_columns: index_cols,
         };
-        db.execute(self.dialect.render_create_table(&schema)).await?;
+        db.execute(self.dialect.render_create_table(&schema))
+            .await?;
         for col in index_cols {
             // ADD COLUMN is not idempotent in SQLite; the duplicate-column
             // error is the expected no-op.
@@ -175,7 +176,8 @@ impl SqliteBackend {
         db.execute(self.dialect.render_create_index(table, "saved_at"))
             .await?;
         for col in index_cols {
-            db.execute(self.dialect.render_create_index(table, col)).await?;
+            db.execute(self.dialect.render_create_index(table, col))
+                .await?;
         }
         for group in unique {
             db.execute(self.dialect.render_create_unique_index(table, group))

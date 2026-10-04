@@ -1018,7 +1018,12 @@ async fn upgrade_hook_reads_rows_an_older_shape_wrote() {
     let id = AirId::<note_v2::Note>::from_bytes(old.id().to_bytes());
     let loaded = s.load(id).await.unwrap().expect("upgraded on load");
     assert_eq!((loaded.text.as_str(), loaded.pinned), ("kept", None));
-    let queried = s.find::<note_v2::Note>().eq("book", "b").all().await.unwrap();
+    let queried = s
+        .find::<note_v2::Note>()
+        .eq("book", "b")
+        .all()
+        .await
+        .unwrap();
     assert_eq!(queried, vec![loaded.clone()]);
     assert_eq!(s.scan::<note_v2::Note>().await.unwrap(), vec![loaded]);
 }
@@ -1208,7 +1213,10 @@ async fn transaction_insert_delete_and_lenient_reads_share_the_transaction() {
         })
         .await
         .unwrap();
-    assert!(conflicted, "a conflict inside the transaction is reported, not fatal");
+    assert!(
+        conflicted,
+        "a conflict inside the transaction is reported, not fatal"
+    );
     assert_eq!((skipped, removed), (1, 1));
     assert_eq!(s.count::<LogLine>().await.unwrap(), 1);
     assert_eq!(s.count::<Strict>().await.unwrap(), 0);
@@ -1230,6 +1238,8 @@ async fn a_rolled_back_transaction_does_not_forget_the_table() {
         .await;
     assert!(failed.is_err());
     assert_eq!(s.count::<LogLine>().await.unwrap(), 0);
-    s.insert(&LogLine::new("r".into(), 1, "b".into())).await.unwrap();
+    s.insert(&LogLine::new("r".into(), 1, "b".into()))
+        .await
+        .unwrap();
     assert_eq!(s.count::<LogLine>().await.unwrap(), 1);
 }

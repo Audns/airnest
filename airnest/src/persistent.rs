@@ -56,6 +56,7 @@ pub trait Persistent: Serialize + DeserializeOwned + Send + Sync + 'static {
     ///
     /// Defaults to no constraints, keeping manual implementations (discouraged)
     /// compiling.
+    #[must_use]
     fn unique_constraints() -> &'static [&'static [&'static str]] {
         &[]
     }
@@ -68,6 +69,7 @@ pub trait Persistent: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Every read path (load, query, scan, transactions) falls back to
     /// this hook, so a migration lives beside the row type and never in
     /// raw SQL. Defaults to `None`: an undecodable row stays an error.
+    #[must_use]
     fn upgrade(raw: &crate::codec::Legacy<'_>) -> Option<Self> {
         let _ = raw;
         None

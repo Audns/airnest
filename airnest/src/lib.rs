@@ -28,8 +28,8 @@ pub use into_air_id::IntoAirId;
 pub use persistent::Persistent;
 pub use serde_helpers::{json_de, json_ser, json_string};
 pub use store::{
-    BackendKind, Decoded, InitMany, Query, ReplaceBuilder, Store, StoreBatch, Tx, TxQuery, UpsertBuilder,
-    UpsertModifyBuilder,
+    BackendKind, Decoded, InitMany, Query, ReplaceBuilder, Store, StoreBatch, Tx, TxQuery,
+    UpsertBuilder, UpsertModifyBuilder,
 };
 
 #[cfg(feature = "postcard")]

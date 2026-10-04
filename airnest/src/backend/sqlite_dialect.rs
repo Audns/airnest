@@ -171,7 +171,7 @@ impl SqlDialect for SqliteDialect {
         // the application's unwrap_or(0) convention.
         let mut next = 3;
         let mut placeholders = String::new();
-        for _ in index_columns.iter() {
+        for _ in index_columns {
             let _ = write!(placeholders, ", {}", self.placeholder(next));
             next += 1;
         }
@@ -192,7 +192,7 @@ impl SqlDialect for SqliteDialect {
         let where_clause = guards.join(" AND ");
 
         let mut col_list = String::new();
-        for col in index_columns.iter() {
+        for col in index_columns {
             let _ = write!(col_list, ", {}", self.quote_ident(col));
         }
         format!(

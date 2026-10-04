@@ -130,7 +130,7 @@ async fn pg_count_and_scan() {
     s.save(&u2).await.unwrap();
     assert_eq!(s.count::<PgUser>().await.unwrap(), 2);
     let all = s.scan::<PgUser>().await.unwrap();
-    let ids: Vec<_> = all.iter().map(|u| u.id()).collect();
+    let ids: Vec<_> = all.iter().map(PgUser::id).collect();
     assert!(ids.contains(&u1.id()));
     assert!(ids.contains(&u2.id()));
 }
@@ -261,13 +261,13 @@ async fn pg_query_count_and_first() {
     let s = store().await;
     let _g = serial().await;
     clean!(s, PgJob);
-    s.save(&PgJob::new("pending".into(), 1, "".into()))
+    s.save(&PgJob::new("pending".into(), 1, String::new()))
         .await
         .unwrap();
-    s.save(&PgJob::new("pending".into(), 2, "".into()))
+    s.save(&PgJob::new("pending".into(), 2, String::new()))
         .await
         .unwrap();
-    s.save(&PgJob::new("running".into(), 3, "".into()))
+    s.save(&PgJob::new("running".into(), 3, String::new()))
         .await
         .unwrap();
 
@@ -295,13 +295,13 @@ async fn pg_count_grouped_by() {
     let s = store().await;
     let _g = serial().await;
     clean!(s, PgJob);
-    s.save(&PgJob::new("pending".into(), 1, "".into()))
+    s.save(&PgJob::new("pending".into(), 1, String::new()))
         .await
         .unwrap();
-    s.save(&PgJob::new("pending".into(), 2, "".into()))
+    s.save(&PgJob::new("pending".into(), 2, String::new()))
         .await
         .unwrap();
-    s.save(&PgJob::new("running".into(), 3, "".into()))
+    s.save(&PgJob::new("running".into(), 3, String::new()))
         .await
         .unwrap();
 
@@ -393,10 +393,10 @@ async fn pg_typed_query_api() {
     let s = store().await;
     let _g = serial().await;
     clean!(s, PgJob);
-    s.save(&PgJob::new("done".into(), 1, "".into()))
+    s.save(&PgJob::new("done".into(), 1, String::new()))
         .await
         .unwrap();
-    s.save(&PgJob::new("done".into(), 2, "".into()))
+    s.save(&PgJob::new("done".into(), 2, String::new()))
         .await
         .unwrap();
     let done = PgJob::find(&s).status("done").all().await.unwrap();

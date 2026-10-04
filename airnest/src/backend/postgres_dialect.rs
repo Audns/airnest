@@ -195,7 +195,7 @@ impl SqlDialect for PostgresDialect {
 
         let mut next = 3;
         let mut placeholders = String::new();
-        for _ in index_columns.iter() {
+        for _ in index_columns {
             let _ = write!(placeholders, ", {}", self.placeholder(next));
             next += 1;
         }
@@ -218,7 +218,7 @@ impl SqlDialect for PostgresDialect {
         let where_clause = guards.join(" AND ");
 
         let mut col_list = String::new();
-        for col in index_columns.iter() {
+        for col in index_columns {
             let _ = write!(col_list, ", {}", self.quote_ident(col));
         }
         format!(
@@ -231,7 +231,9 @@ impl SqlDialect for PostgresDialect {
     }
 
     fn numeric_sort_expr(&self, quoted_column: &str) -> String {
-        format!("(CASE WHEN {quoted_column} ~ '^-?[0-9]+$' THEN {quoted_column}::bigint ELSE 0 END)")
+        format!(
+            "(CASE WHEN {quoted_column} ~ '^-?[0-9]+$' THEN {quoted_column}::bigint ELSE 0 END)"
+        )
     }
 
     fn render_select(&self, request: &QueryRequest, select_clause: &str) -> RenderedSelect {

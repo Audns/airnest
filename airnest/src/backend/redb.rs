@@ -123,10 +123,7 @@ struct Record {
 fn record_matches(rec: &Record, filters: &[Filter]) -> bool {
     filters.iter().all(|filter| match filter {
         Filter::Eq(col, val) => rec.index_values.get(col) == Some(val),
-        Filter::In(col, vals) => rec
-            .index_values
-            .get(col)
-            .is_some_and(|v| vals.contains(v)),
+        Filter::In(col, vals) => rec.index_values.get(col).is_some_and(|v| vals.contains(v)),
     })
 }
 
@@ -222,6 +219,7 @@ impl RedbBackend {
 }
 
 impl Backend for RedbBackend {
+    #[allow(clippy::unused_async_trait_impl)]
     async fn ensure_table<T: Persistent>(&self) -> Result<(), StoreError> {
         let mut guard = self.tables.write().map_err(|_| StoreError::Poisoned)?;
         guard.insert(T::TABLE);
@@ -511,19 +509,9 @@ impl Backend for RedbBackend {
                     // Use HashSet for O(1) lookups when vals is large.
                     if vals.len() > 8 {
                         let set: HashSet<&String> = vals.iter().collect();
-                        recs.retain(|r| {
-                            r.index_values
-                                .get(col)
-                                .map(|v| set.contains(v))
-                                .unwrap_or(false)
-                        });
+                        recs.retain(|r| r.index_values.get(col).is_some_and(|v| set.contains(v)));
                     } else {
-                        recs.retain(|r| {
-                            r.index_values
-                                .get(col)
-                                .map(|v| vals.contains(v))
-                                .unwrap_or(false)
-                        });
+                        recs.retain(|r| r.index_values.get(col).is_some_and(|v| vals.contains(v)));
                     }
                 }
             }
@@ -688,12 +676,7 @@ impl Backend for RedbBackend {
                     recs.retain(|r| r.index_values.get(col) == Some(val));
                 }
                 Filter::In(col, vals) => {
-                    recs.retain(|r| {
-                        r.index_values
-                            .get(col)
-                            .map(|v| vals.contains(v))
-                            .unwrap_or(false)
-                    });
+                    recs.retain(|r| r.index_values.get(col).is_some_and(|v| vals.contains(v)));
                 }
             }
         }
@@ -964,6 +947,7 @@ impl Backend for RedbBackend {
         .map_err(StoreError::Join)?
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn query_raw<T: Persistent>(
         &self,
         _sql: &str,

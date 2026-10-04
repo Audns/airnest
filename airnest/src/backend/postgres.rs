@@ -61,10 +61,10 @@ impl PostgresBackend {
     }
 
     fn cached_upsert(&self, schema: &TableSchema) -> String {
-        if let Ok(cache) = self.upsert_cache.read() {
-            if let Some(sql) = cache.get(schema.table) {
-                return sql.clone();
-            }
+        if let Ok(cache) = self.upsert_cache.read()
+            && let Some(sql) = cache.get(schema.table)
+        {
+            return sql.clone();
         }
         let sql = self.dialect.render_upsert(schema);
         if let Ok(mut cache) = self.upsert_cache.write() {
@@ -473,7 +473,7 @@ impl Backend for PostgresBackend {
                 .await?;
         } else {
             let (where_clause, binds) = self.dialect.render_where_clause(&dialect_filters);
-            let sql = format!("DELETE FROM {} WHERE {where_clause}", self.quote(table),);
+            let sql = format!("DELETE FROM {} WHERE {where_clause}", self.quote(table));
             let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for b in binds {
                 query = query.bind(b);
